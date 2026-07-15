@@ -26,7 +26,7 @@ impl Store for Korthaien {
         &self,
         client: &reqwest::blocking::Client,
         card_name: &str,
-    ) -> anyhow::Result<Option<StoreResult>> {
+    ) -> anyhow::Result<Vec<StoreResult>> {
         let all_products = fetch_search_results(client, card_name)?;
 
         // Filter to in-stock products whose name matches (case-insensitive,
@@ -37,18 +37,18 @@ impl Store for Korthaien {
             .collect();
 
         if matching.is_empty() {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         // Prefer non-foil (cheapest), then foil (cheapest)
         let best = pick_best(&matching, card_name).unwrap();
 
-        Ok(Some(StoreResult {
+        Ok(vec![StoreResult {
             store_name: STORE_NAME.to_string(),
             card_name: card_name.to_string(),
             price: best.price,
             url: best.url.clone(),
-        }))
+        }])
     }
 }
 

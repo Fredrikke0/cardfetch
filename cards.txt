@@ -1,28 +1,69 @@
-1 Snakeskin Veil
-1 Inspiring Call
-1 Invigorating Surge
-1 Hardened Scales
-1 Forgotten Ancient
-1 Winding Constrictor
-1 Swarm Shambler
-1 Fertilid
-1 Hydra's Growth
-1 Wildwood Scourge
-1 Oran-Rief, the Vastwood
-1 Iridescent Hornbeetle
-1 Golgari Signet
-1 Branching Evolution
-1 Undying Malice
-1 Master Chef
-1 Cursed Wombat
-1 Pridemalkin
-1 Victimize
-1 Deathsprout
-1 Incubation Druid
-1 Scavenging Ooze
-1 Fangs of Kalonia
-1 Host of the Hereafter
-1 Stocking the Pantry
+1 Evolving Wilds
+1 Guildmages' Forum
+1 Hangarback Walker
+1 Llanowar Reborn
 1 Opal Palace
+1 Oran-Rief, the Vastwood
+1 Terramorphic Expanse
+1 Ambitious Augmenter
+1 Capricopian
+1 Ghost Lantern
+1 Gift of the Viper
+1 Iron Apprentice
+1 Kinetic Ooze
+1 Llanowar Elves
+1 Ochre Jelly
+1 Pelt Collector
+1 Ravenous Squirrel
+1 Retribution of the Ancients
+1 Silkguard
+1 Snakeskin Veil
+1 Stocking the Pantry
+1 Swarm Shambler
+1 Thirsting Roots
+1 Undying Malice
+1 Basking Broodscale
+1 Cankerbloom
+1 Cathedral Acolyte
+1 Cursed Wombat
+1 Drown in Ichor
+1 Emergent Sequence
+1 Evolutionary Escalation
+1 Explorer's Cache
+1 Golgari Signet
+1 Hammerhead, Maggia Boss
+1 Necrosynthesis
+1 Ordeal of Nylea
+1 Quirion Beastcaller
+1 Sakura-Tribe Elder
+1 Scavenging Ooze
+1 Synchronized Charge
+1 Tender Wildguide
+1 Umbral Collar Zealot
+1 Winding Constrictor
+1 Wither and Bloom
+1 Bloodflow Connoisseur
+1 Communal Brewing
+1 Evolution Witness
+1 Fertilid
+1 Inspiring Call
+1 Kami of Whispered Hopes
+1 Master Chef
+1 Purestrain Genestealer
+1 Putrefy
+1 Rishkar, Peema Renegade
+1 Signature Slam
+1 Bloodspore Thrinax
+1 Corpsejack Menace
+1 Dimension X Pizzasaur
+1 Forgotten Ancient
+1 Host of the Hereafter
+1 Lily Bowen, Raging Grandma
+1 Merchant of Venom
+1 Renata, Called to the Hunt
+1 Tributary Instructor
+1 Wildgrowth Archaic
+1 Iridescent Hornbeetle
+1 Loyal Guardian
+1 Ribtruss Roaster
 1 Find // Finality
-1 Golgari Rot Farm

@@ -27,7 +27,7 @@ impl Store for Collectible {
         &self,
         client: &reqwest::blocking::Client,
         card_name: &str,
-    ) -> anyhow::Result<Option<StoreResult>> {
+    ) -> anyhow::Result<Vec<StoreResult>> {
         let search_url = format!(
             "{}?s={}&post_type=product&stock_status=instock",
             SEARCH_URL,
@@ -64,15 +64,15 @@ impl Store for Collectible {
             // collectible.no sometimes redirects to a fuzzy "best match" that
             // is a completely different card.
             if !super::title_contains(card_name, &product_title) {
-                return Ok(None);
+                return Ok(vec![]);
             }
 
-            return Ok(Some(StoreResult {
+            return Ok(vec![StoreResult {
                 store_name: STORE_NAME.to_string(),
                 card_name: card_name.to_string(),
                 price,
                 url: product_url,
-            }));
+            }]);
         }
 
         if !response.status().is_success() {
@@ -88,15 +88,15 @@ impl Store for Collectible {
         let matching = products.iter().find(|p| title_contains(card_name, &p.name));
 
         if let Some(product) = matching {
-            return Ok(Some(StoreResult {
+            return Ok(vec![StoreResult {
                 store_name: STORE_NAME.to_string(),
                 card_name: card_name.to_string(),
                 price: product.price,
                 url: product.url.clone(),
-            }));
+            }]);
         }
 
-        Ok(None)
+        Ok(vec![])
     }
 }
 

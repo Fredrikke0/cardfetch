@@ -72,12 +72,12 @@ pub trait Store: Send + Sync {
     /// Timeout for HTTP requests to this store (in seconds).
     fn timeout_secs(&self) -> u64;
 
-    /// Search for a single card. Returns None if no in-stock match found.
+    /// Search for a single card. Returns zero or more results (empty vec = no match).
     fn search(
         &self,
         client: &reqwest::blocking::Client,
         card_name: &str,
-    ) -> anyhow::Result<Option<StoreResult>>;
+    ) -> anyhow::Result<Vec<StoreResult>>;
 }
 
 pub struct StoreResult {
@@ -121,7 +121,7 @@ pub fn all_stores() -> Vec<Box<dyn Store>> {
 | Name normalization & matching | Per-store |
 | Price formatting | Central (`output::format_price`) |
 | Rate limiting (delay) | Shared (`DELAY_MS` constant) |
-| URL encoding helpers | Shared (`urlencode_pct`, `urlencode_plus`) |
+| URL encoding helpers | Shared (`urlencode_pct`, `urlencode_plus`, `title_to_slug`) |
 | Substring matching | Shared (`title_contains`) |
 | Parsed product type | Shared (`SearchProduct`) |
 
@@ -142,6 +142,10 @@ outland-specific GraphQL types, query template, and matching logic.
 6. **Print** — grouped output.
 
 ## Output format
+
+Store columns are discovered dynamically from the results. Each unique
+`store_name` found in any result becomes a table column. This allows stores
+like CardMarket to return per-seller results.
 
 ```
 Snakeskin Veil:

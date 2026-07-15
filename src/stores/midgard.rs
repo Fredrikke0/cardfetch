@@ -27,7 +27,7 @@ impl Store for Midgard {
         &self,
         client: &reqwest::blocking::Client,
         card_name: &str,
-    ) -> anyhow::Result<Option<StoreResult>> {
+    ) -> anyhow::Result<Vec<StoreResult>> {
         let all_products = fetch_search_results(client, card_name)?;
 
         // Pick the cheapest in-stock product whose title contains the card name
@@ -37,15 +37,15 @@ impl Store for Midgard {
             .min_by_key(|p| p.price)
         {
             Some(p) => p,
-            None => return Ok(None),
+            None => return Ok(vec![]),
         };
 
-        Ok(Some(StoreResult {
+        Ok(vec![StoreResult {
             store_name: STORE_NAME.to_string(),
             card_name: card_name.to_string(),
             price: best.price,
             url: best.url.clone(),
-        }))
+        }])
     }
 }
 

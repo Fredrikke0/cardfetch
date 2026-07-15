@@ -12,141 +12,226 @@ pub enum CacheLookup {
     /// No valid cache entry — perform a live search.
     Search,
     /// Negative cache hit — previous search had no results and is still fresh.
-    /// Skip this store entirely (no result to return).
     Skip,
-    /// Positive cache hit — return this cached result.
-    Hit(StoreResult),
+    /// Positive cache hit — return these cached results (may be multiple for
+    /// stores like CardMarket that return several sellers per card).
+    Hit(Vec<StoreResult>),
 }
 
 /// Thread-safe SQLite cache for store search results.
+///
+/// Uses a single `listings` table where each row is one product listing.
+/// A (card, store) pair can have multiple rows (e.g. CardMarket sellers).
+/// Negative cache is recorded as a row with `in_stock = 0`.
 pub struct Cache {
     conn: Mutex<Connection>,
 }
 
 impl Cache {
-    /// Open (or create) the cache database at `path`.  Enables WAL mode and
-    /// creates tables if they don't exist.
+    /// Open (or create) the cache database at `path`.  Enables WAL mode,
+    /// drops the old two-table schema, and creates the new `listings` table.
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let conn = Connection::open(path).context("Failed to open cache database")?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .context("Failed to enable WAL mode")?;
 
+        // Drop old schema (no backwards compatibility needed)
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS history (
-                card_name   TEXT NOT NULL,
-                store_name  TEXT NOT NULL,
-                searched_at INTEGER NOT NULL,
-                found_match INTEGER NOT NULL,
-                PRIMARY KEY (card_name, store_name)
-            );
-            CREATE TABLE IF NOT EXISTS matches (
-                card_name   TEXT NOT NULL,
-                store_name  TEXT NOT NULL,
-                url         TEXT NOT NULL,
-                price       INTEGER NOT NULL,
-                fetched_at  INTEGER NOT NULL,
-                PRIMARY KEY (card_name, store_name)
-            );",
+            "DROP TABLE IF EXISTS history;
+             DROP TABLE IF EXISTS matches;",
         )
-        .context("Failed to create cache tables")?;
+        .context("Failed to drop old tables")?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS listings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_name   TEXT NOT NULL,
+                store_name  TEXT NOT NULL,
+                price       INTEGER NOT NULL,
+                url         TEXT NOT NULL,
+                in_stock    INTEGER NOT NULL DEFAULT 1,
+                fetched_at  INTEGER NOT NULL,
+                UNIQUE(card_name, store_name, url)
+            );
+            CREATE INDEX IF NOT EXISTS idx_listings_card
+                ON listings(card_name);
+            CREATE INDEX IF NOT EXISTS idx_listings_lookup
+                ON listings(card_name, store_name);",
+        )
+        .context("Failed to create listings table")?;
 
         Ok(Cache {
             conn: Mutex::new(conn),
         })
     }
 
-    /// Check the cache for a (card, store) pair.  Returns:
-    /// - `Search` if no entry exists or it's stale
-    /// - `Skip` if a negative cache entry is fresh
-    /// - `Hit(result)` if a positive cache entry is fresh
+    /// Check the cache for a (card, store) pair.
+    ///
+    /// The `store_name` parameter acts as a *cache key prefix*: both exact
+    /// matches (negative cache entries) and `"prefix: ..."` rows (seller-
+    /// specific results from stores like CardMarket) are considered.
+    ///
+    /// Returns `Hit(vec![...])` with all in-stock results if the positive
+    /// cache is fresh, `Skip` if the negative cache is fresh, or `Search`
+    /// if the cache is stale or missing.
     pub fn lookup(&self, card_name: &str, store_name: &str) -> anyhow::Result<CacheLookup> {
         let conn = self.conn.lock().unwrap();
+        let now = epoch_secs();
 
+        // Match both exact (negative entries) and prefix (seller entries like
+        // "cardmarket.com: SellerName").  The LIKE pattern uses SQLite `||`
+        // for concatenation so we don't need to build the pattern in Rust.
         let mut stmt = conn.prepare(
-            "SELECT searched_at, found_match FROM history WHERE card_name = ?1 AND store_name = ?2",
+            "SELECT MAX(fetched_at),
+                    COALESCE(SUM(CASE WHEN in_stock = 1 THEN 1 ELSE 0 END), 0)
+             FROM listings
+             WHERE card_name = ?1
+               AND (store_name = ?2 OR store_name LIKE (?2 || ':%'))",
         )?;
 
-        let row = stmt
+        let row: Option<(Option<i64>, i64)> = stmt
             .query_row(rusqlite::params![card_name, store_name], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
             })
             .optional()?;
 
-        let (searched_at, found_match) = match row {
-            Some(r) => r,
-            None => return Ok(CacheLookup::Search),
-        };
+        match row {
+            Some((Some(fetched_at), in_stock_count)) => {
+                let age = Duration::from_secs((now - fetched_at).max(0) as u64);
 
-        let now = epoch_secs();
-        let age = Duration::from_secs((now - searched_at).max(0) as u64);
+                if in_stock_count == 0 {
+                    return Ok(if age < NEGATIVE_TTL {
+                        CacheLookup::Skip
+                    } else {
+                        CacheLookup::Search
+                    });
+                }
+                if age >= POSITIVE_TTL {
+                    return Ok(CacheLookup::Search);
+                }
 
-        if found_match == 0 {
-            if age < NEGATIVE_TTL {
-                return Ok(CacheLookup::Skip);
+                let mut res_stmt = conn.prepare(
+                    "SELECT price, url, store_name FROM listings
+                     WHERE card_name = ?1
+                       AND (store_name = ?2 OR store_name LIKE (?2 || ':%'))
+                       AND in_stock = 1",
+                )?;
+                let results: Vec<StoreResult> = res_stmt
+                    .query_map(rusqlite::params![card_name, store_name], |row| {
+                        Ok(StoreResult {
+                            store_name: row.get::<_, String>(2)?,
+                            card_name: card_name.to_string(),
+                            price: row.get::<_, u32>(0)?,
+                            url: row.get::<_, String>(1)?,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(CacheLookup::Hit(results))
             }
-            return Ok(CacheLookup::Search);
-        }
-
-        // found_match == 1: check matches table for freshness
-        let mut match_stmt = conn.prepare(
-            "SELECT url, price FROM matches WHERE card_name = ?1 AND store_name = ?2",
-        )?;
-
-        let match_row = match_stmt
-            .query_row(
-                rusqlite::params![card_name, store_name],
-                |row| {
-                    Ok(StoreResult {
-                        store_name: store_name.to_string(),
-                        card_name: card_name.to_string(),
-                        price: row.get::<_, u32>(1)?,
-                        url: row.get::<_, String>(0)?,
-                    })
-                },
-            )
-            .optional()?;
-
-        match match_row {
-            Some(result) if age < POSITIVE_TTL => Ok(CacheLookup::Hit(result)),
             _ => Ok(CacheLookup::Search),
         }
     }
 
-    /// Store a search result (or lack thereof) in the cache.  If `result` is
-    /// `None`, a negative cache entry is recorded.  If `Some`, the match is
-    /// stored in the `matches` table alongside a positive history entry.
+    /// Store search results (or lack thereof) in the cache.
+    ///
+    /// If `results` is `None` or empty, a negative cache entry is recorded.
+    /// Otherwise, all results are inserted.
     pub fn store(
         &self,
         card_name: &str,
         store_name: &str,
-        result: Option<&StoreResult>,
+        results: Option<&[StoreResult]>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = epoch_secs();
 
+        // Remove all old entries for this (card, store)
         conn.execute(
-            "INSERT OR REPLACE INTO history (card_name, store_name, searched_at, found_match)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![card_name, store_name, now, if result.is_some() { 1 } else { 0 }],
-        )?;
-
-        conn.execute(
-            "DELETE FROM matches WHERE card_name = ?1 AND store_name = ?2",
+            "DELETE FROM listings WHERE card_name = ?1 AND store_name = ?2",
             rusqlite::params![card_name, store_name],
         )?;
 
-        if let Some(r) = result {
+        // For CardMarket sub-sellers (e.g. "cardmarket.com: Seller"), also
+        // clean up any stale negative cache entry for the base store prefix
+        // (e.g. "cardmarket.com") that may have been written by a previous
+        // empty-search run.
+        if let Some((prefix, _)) = store_name.split_once(':') {
             conn.execute(
-                "INSERT INTO matches (card_name, store_name, url, price, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![card_name, store_name, r.url, r.price, now],
+                "DELETE FROM listings WHERE card_name = ?1 AND store_name = ?2 AND in_stock = 0",
+                rusqlite::params![card_name, prefix],
             )?;
+        }
+
+        match results {
+            Some(items) if !items.is_empty() => {
+                let mut stmt = conn.prepare(
+                    "INSERT OR REPLACE INTO listings
+                        (card_name, store_name, price, url, in_stock, fetched_at)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                )?;
+                for item in items {
+                    stmt.execute(rusqlite::params![
+                        card_name, store_name, item.price, item.url, now,
+                    ])?;
+                }
+            }
+            _ => {
+                // Negative cache — single row with in_stock=0
+                conn.execute(
+                    "INSERT INTO listings
+                        (card_name, store_name, price, url, in_stock, fetched_at)
+                     VALUES (?1, ?2, 0, '', 0, ?3)",
+                    rusqlite::params![card_name, store_name, now],
+                )?;
+            }
         }
 
         Ok(())
     }
+
+    /// Get all in-stock listings for the given card names.
+    ///
+    /// Used by the purchase wizard to load all relevant data in one query.
+    /// Results are returned unsorted; the caller groups them as needed.
+    pub fn get_listings(&self, card_names: &[String]) -> anyhow::Result<Vec<StoreResult>> {
+        if card_names.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+
+        let placeholders: Vec<String> = (1..=card_names.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT card_name, store_name, price, url FROM listings
+             WHERE card_name IN ({}) AND in_stock = 1",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = card_names
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let results: Vec<StoreResult> = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(StoreResult {
+                    card_name: row.get::<_, String>(0)?,
+                    store_name: row.get::<_, String>(1)?,
+                    price: row.get::<_, u32>(2)?,
+                    url: row.get::<_, String>(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn epoch_secs() -> i64 {
     SystemTime::now()
@@ -155,7 +240,6 @@ fn epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Extension trait to get `Option<T>` from rusqlite `Result<T>`.
 trait OptionalExt<T> {
     fn optional(self) -> Result<Option<T>, rusqlite::Error>;
 }

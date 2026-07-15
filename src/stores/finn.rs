@@ -34,7 +34,7 @@ impl Store for Finn {
         &self,
         client: &reqwest::blocking::Client,
         card_name: &str,
-    ) -> anyhow::Result<Option<StoreResult>> {
+    ) -> anyhow::Result<Vec<StoreResult>> {
         let docs = fetch_search_results(client, card_name)?;
 
         // Fetch each ad's full description from the HTML and check for card name
@@ -56,16 +56,16 @@ impl Store for Finn {
                     .clone()
                     .unwrap_or_else(|| format!("{}/{}", ITEM_URL, doc.id));
 
-                return Ok(Some(StoreResult {
+                return Ok(vec![StoreResult {
                     store_name: STORE_NAME.to_string(),
                     card_name: card_name.to_string(),
                     price: price_oere,
                     url,
-                }));
+                }]);
             }
         }
 
-        Ok(None)
+        Ok(vec![])
     }
 }
 

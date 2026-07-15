@@ -30,7 +30,7 @@ impl Store for Outland {
         &self,
         client: &reqwest::blocking::Client,
         card_name: &str,
-    ) -> anyhow::Result<Option<StoreResult>> {
+    ) -> anyhow::Result<Vec<StoreResult>> {
         let all_items = fetch_all_pages(client, card_name)?;
 
         let item = match all_items
@@ -38,17 +38,17 @@ impl Store for Outland {
             .find(|item| names_match(card_name, &item.name))
         {
             Some(item) => item,
-            None => return Ok(None),
+            None => return Ok(vec![]),
         };
 
         let price = &item.price_range.minimum_price.final_price;
         let price_oere = (price.value * 100.0).round() as u32;
-        Ok(Some(StoreResult {
+        Ok(vec![StoreResult {
             store_name: STORE_NAME.to_string(),
             card_name: card_name.to_string(),
             price: price_oere,
             url: format!("{}/{}", STORE_BASE_URL, item.url_key),
-        }))
+        }])
     }
 }
 
