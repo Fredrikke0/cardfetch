@@ -7,7 +7,10 @@ edition = "2021"
 anyhow = "1"
 indicatif = "0.17"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls-vendored", "http2", "blocking", "cookies"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "blocking", "cookies"] }
+wreq = { version = "6.0.0-rc.29", default-features = false, features = ["tokio-rt", "cookies", "json", "form"] }
+wreq-util = "3.0.0-rc"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 scraper = "0.22"
 serde = { version = "1", features = ["derive"] }

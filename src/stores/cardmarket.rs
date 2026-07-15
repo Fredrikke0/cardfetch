@@ -2,13 +2,13 @@ use super::{title_contains, title_to_slug, Store, StoreResult};
 use crate::shipping::{self, EUR_TO_NOK, VAT_MULTIPLIER};
 use anyhow::Context;
 use base64::Engine;
-use rand::Rng;
 use scraper::Html;
-use std::sync::{atomic::AtomicBool, atomic::Ordering, Mutex};
-use std::time::Duration;
+use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Mutex;
+use wreq_util::Emulation;
 
 const CARD_URL: &str = "https://www.cardmarket.com/en/Magic/Cards";
-const HOMEPAGE_URL: &str = "https://www.cardmarket.com/en/Magic";
 const STORE_PREFIX: &str = "cardmarket.com";
 const STORE_PREFIX_INT: &str = "cardmarket-int.com";
 const STORE_PREFIX_INT_PRIVATE: &str = "cardmarket-int-private.com";
@@ -21,90 +21,145 @@ const SELLER_TYPE_PRIVATE_INT: &str = "0";
 const TIMEOUT_SECS: u64 = 30;
 const MAX_LOAD_MORE_PAGES: u32 = 10;
 
-/// Minimum delay between successive CardMarket requests (milliseconds).
-const CM_DELAY_MIN_MS: u64 = 800;
-/// Additional random jitter added on top of the minimum delay (milliseconds).
-const CM_DELAY_JITTER_MS: u64 = 1200;
+/// How many Cloudflare blocks before we stop trying CardMarket for this run.
+const BLOCK_LIMIT: u32 = 3;
 
-/// A realistic Chrome-on-Windows user agent.
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+/// Global counter for Cloudflare blocks during this run.
+static BLOCK_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Whether semi-manual rescue mode is active.
+static SEMI_MANUAL: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable semi-manual rescue mode.
+pub(crate) fn set_semi_manual(v: bool) {
+    SEMI_MANUAL.store(v, Ordering::Relaxed);
+}
+
+/// Check whether CardMarket has hit the block limit and should be skipped.
+/// In semi-manual mode, never give up — failed fetches get queued for rescue.
+pub fn is_blocked() -> bool {
+    if SEMI_MANUAL.load(Ordering::Relaxed) {
+        return false;
+    }
+    BLOCK_COUNT.load(Ordering::Relaxed) >= BLOCK_LIMIT
+}
+
+/// Record a Cloudflare block.
+fn record_cloudflare_block() {
+    BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Check if an error is a Cloudflare challenge block.
+fn is_cloudflare_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| c.to_string().contains("Cloudflare challenge"))
+}
+
+// ── Rescue queue ────────────────────────────────────────────────────────────
+
+/// A card+endpoint that needs manual rescue via browser.
+#[derive(Debug, Clone)]
+pub(crate) struct RescueItem {
+    pub card_name: String,
+    pub sub_key: String,
+    pub url: String,
+}
+
+/// Queue of (card, endpoint) pairs blocked by Cloudflare, pending manual rescue.
+static RESCUE_QUEUE: Mutex<Vec<RescueItem>> = Mutex::new(Vec::new());
+
+/// Push a rescue item onto the queue.
+fn queue_rescue(card_name: &str, sub_key: &str, url: &str) {
+    RESCUE_QUEUE.lock().unwrap().push(RescueItem {
+        card_name: card_name.to_string(),
+        sub_key: sub_key.to_string(),
+        url: url.to_string(),
+    });
+}
+
+/// Drain and return all queued rescue items.
+pub(crate) fn drain_rescue_queue() -> Vec<RescueItem> {
+    std::mem::take(&mut *RESCUE_QUEUE.lock().unwrap())
+}
+
+/// Error type signalling a fetch is queued for manual rescue.
+#[derive(Debug)]
+pub(crate) struct RescuePending;
+
+impl std::fmt::Display for RescuePending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "queued for semi-manual rescue")
+    }
+}
+
+impl std::error::Error for RescuePending {}
+
+/// Return the JS snippet the user pastes into the browser console.
+pub(crate) fn rescue_js_snippet() -> &'static str {
+    "copy(JSON.stringify(\
+     [...document.querySelectorAll('.article-row')].map(row=>{\
+       const a=row.querySelector('.seller-name a');\
+       const p=row.querySelector('.col-offer span.color-primary.fw-bold,.col-offer span.color-primary');\
+       const c=row.querySelector('.col-offer span.item-count');\
+       const h=a?.getAttribute('href')||'';\
+       return {\
+         n:a?.textContent?.trim()||'',\
+         p:p?.textContent?.trim()||'',\
+         c:parseInt(c?.textContent?.trim())||1,\
+         u:h.startsWith('http')?h:'https://www.cardmarket.com'+h\
+       };\
+     })\
+   ));"
+}
 
 pub struct CardMarket {
-    client: reqwest::blocking::Client,
+    client: wreq::Client,
+    rt: tokio::runtime::Runtime,
     verbose: bool,
-    /// Tracks when the last request was sent so we can pace ourselves.
-    last_request: Mutex<std::time::Instant>,
-    /// Whether we've done the initial homepage warmup yet.
-    warmed_up: AtomicBool,
 }
 
 impl CardMarket {
     pub fn new(verbose: bool) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(USER_AGENT)
-            .cookie_store(true)
-            .http2_prior_knowledge()
-            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-            .default_headers({
-                let mut h = reqwest::header::HeaderMap::new();
-                h.insert(
-                    reqwest::header::ACCEPT,
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
-                        .parse()
-                        .unwrap(),
-                );
-                h.insert(
-                    reqwest::header::ACCEPT_LANGUAGE,
-                    "en-US,en;q=0.9,nb;q=0.8".parse().unwrap(),
-                );
-                h.insert(
-                    "sec-ch-ua",
-                    "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""
-                        .parse()
-                        .unwrap(),
-                );
-                h.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
-                h.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
-                h.insert(
-                    reqwest::header::UPGRADE_INSECURE_REQUESTS,
-                    "1".parse().unwrap(),
-                );
-                h
-            })
-            .build()
-            .expect("Failed to build CardMarket HTTP client");
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let client = rt.block_on(async {
+            wreq::Client::builder()
+                .emulation(Emulation::Chrome124)
+                .cookie_store(true)
+                .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+                .default_headers({
+                    let mut h = wreq::header::HeaderMap::new();
+                    h.insert(
+                        "accept",
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                            .parse()
+                            .unwrap(),
+                    );
+                    h.insert(
+                        "accept-language",
+                        "en-US,en;q=0.9".parse().unwrap(),
+                    );
+                    h.insert(
+                        "sec-ch-ua",
+                        "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\""
+                            .parse()
+                            .unwrap(),
+                    );
+                    h.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+                    h.insert(
+                        "sec-ch-ua-platform",
+                        "\"Windows\"".parse().unwrap(),
+                    );
+                    h.insert("upgrade-insecure-requests", "1".parse().unwrap());
+                    h
+                })
+                .build()
+        })
+        .expect("Failed to build CardMarket wreq client");
         CardMarket {
             client,
+            rt,
             verbose,
-            last_request: Mutex::new(std::time::Instant::now()),
-            warmed_up: AtomicBool::new(false),
         }
-    }
-
-    /// Pace requests so we don't hammer the server.
-    /// Sleeps a random amount if the last request was too recent.
-    fn throttle(&self) {
-        let mut last = self.last_request.lock().unwrap();
-        let elapsed = last.elapsed();
-        let min_delay = Duration::from_millis(CM_DELAY_MIN_MS);
-        if elapsed < min_delay {
-            let extra = rand::thread_rng().gen_range(0..CM_DELAY_JITTER_MS);
-            std::thread::sleep(min_delay - elapsed + Duration::from_millis(extra));
-        }
-        *last = std::time::Instant::now();
-    }
-
-    /// Visit the homepage once to establish a session (cookies + cf_clearance).
-    fn warmup(&self) {
-        if self.warmed_up.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        if self.verbose {
-            eprintln!("  [cardmarket.com] warming up session...");
-        }
-        let _ = self.client.get(HOMEPAGE_URL).send();
-        // Small pause after warmup before hitting product pages
-        std::thread::sleep(Duration::from_millis(1500));
     }
 }
 
@@ -130,6 +185,9 @@ impl Store for CardMarket {
         _client: &reqwest::blocking::Client,
         card_name: &str,
     ) -> anyhow::Result<Vec<StoreResult>> {
+        if is_blocked() {
+            return Ok(vec![]);
+        }
         let slug = title_to_slug(card_name);
         let mut results = self.fetch_norwegian(card_name, &slug)?;
         results.extend(self.fetch_int_powerseller(card_name, &slug)?);
@@ -143,23 +201,54 @@ impl Store for CardMarket {
         card_name: &str,
         sub_key: &str,
     ) -> anyhow::Result<Vec<StoreResult>> {
+        if is_blocked() {
+            return Ok(vec![]);
+        }
         let slug = title_to_slug(card_name);
-        match sub_key {
+        let result = match sub_key {
             STORE_PREFIX => self.fetch_norwegian(card_name, &slug),
             STORE_PREFIX_INT => self.fetch_int_powerseller(card_name, &slug),
             STORE_PREFIX_INT_PRIVATE => self.fetch_int_private(card_name, &slug),
             _ => anyhow::bail!("Unknown CardMarket sub-store: {}", sub_key),
+        };
+        match result {
+            Ok(r) => Ok(r),
+            Err(ref e) if is_cloudflare_error(e) => {
+                record_cloudflare_block();
+                if SEMI_MANUAL.load(Ordering::Relaxed) {
+                    Err(anyhow::Error::new(RescuePending))
+                } else {
+                    Err(anyhow::anyhow!("Cloudflare challenge"))
+                }
+            }
+            Err(e) => {
+                let detail: String = e
+                    .chain()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(": ");
+                if self.verbose {
+                    eprintln!("  [{}] {detail}", sub_key);
+                }
+                Err(anyhow::anyhow!("{detail}"))
+            }
         }
     }
 }
 
 impl CardMarket {
     fn fetch_norwegian(&self, card_name: &str, slug: &str) -> anyhow::Result<Vec<StoreResult>> {
-        self.warmup();
-        self.throttle();
         let url = format!("{CARD_URL}/{slug}?sellerCountry={SELLER_COUNTRY}&language=1");
-        fetch_page_sellers(&self.client, &url, card_name, false, false)
-            .context("CardMarket (NO) failed")
+        fetch_page_sellers(
+            &self.client,
+            &self.rt,
+            &url,
+            card_name,
+            false,
+            false,
+            self.verbose,
+        )
+        .context("CardMarket (NO) failed")
     }
 
     fn fetch_int_powerseller(
@@ -167,12 +256,11 @@ impl CardMarket {
         card_name: &str,
         slug: &str,
     ) -> anyhow::Result<Vec<StoreResult>> {
-        self.warmup();
-        self.throttle();
         let url = format!("{CARD_URL}/{slug}?sellerType={SELLER_TYPE_INT}&language=1");
         let filter = r#"{"sellerStatus":[1,2],"idLanguage":{"1":1}}"#;
         fetch_all_sellers(
             &self.client,
+            &self.rt,
             &url,
             card_name,
             filter,
@@ -184,12 +272,11 @@ impl CardMarket {
     }
 
     fn fetch_int_private(&self, card_name: &str, slug: &str) -> anyhow::Result<Vec<StoreResult>> {
-        self.warmup();
-        self.throttle();
         let url = format!("{CARD_URL}/{slug}?sellerType={SELLER_TYPE_PRIVATE_INT}&language=1");
         let filter = r#"{"sellerStatus":[0],"idLanguage":{"1":1}}"#;
         fetch_all_sellers(
             &self.client,
+            &self.rt,
             &url,
             card_name,
             filter,
@@ -201,43 +288,47 @@ impl CardMarket {
     }
 }
 
-/// Fetch just the initial page (no load-more). Used for Norwegian sellers
-/// where the AJAX country filter format is unknown.
+/// Fetch just the initial page (no load-more).
 fn fetch_page_sellers(
-    client: &reqwest::blocking::Client,
+    client: &wreq::Client,
+    rt: &tokio::runtime::Runtime,
     url: &str,
     card_name: &str,
     is_international: bool,
     is_private: bool,
+    verbose: bool,
 ) -> anyhow::Result<Vec<StoreResult>> {
-    let response = client
-        .get(url)
-        .header(
-            reqwest::header::REFERER,
-            "https://www.cardmarket.com/en/Magic",
-        )
-        .send()
-        .context("GET card page failed")?;
-    if !response.status().is_success() {
-        anyhow::bail!("CardMarket returned HTTP {}", response.status().as_u16());
+    if verbose {
+        eprintln!("  [cardmarket] GET {url}");
     }
-    let html = response.text().context("Failed to read page body")?;
+    let response = rt
+        .block_on(client.get(url).send())
+        .context("GET card page failed")?;
+    if verbose {
+        eprintln!("  [cardmarket] <- HTTP {} ", response.status());
+        for (name, value) in response.headers() {
+            eprintln!("  [cardmarket]   {name}: {value:?}");
+        }
+    }
+    let status = response.status();
+    let html = rt
+        .block_on(response.text())
+        .context("Failed to read page body")?;
 
-    // Detect Cloudflare challenge page
+    // Check for Cloudflare challenge before rejecting on status code —
+    // managed challenges often return 403 with a challenge body.
     if html.contains("challenges.cloudflare.com") || html.contains("_cf_chl_opt") {
+        let prefix = store_prefix_from_flags(is_international, is_private);
+        queue_rescue(card_name, prefix, url);
         anyhow::bail!("Cloudflare challenge detected — try again later or from a different IP");
+    }
+
+    if !status.is_success() {
+        anyhow::bail!("CardMarket returned HTTP {}", status.as_u16());
     }
 
     let document = Html::parse_document(&html);
     let entries = try_extract_sellers(&document)?;
-
-    let store_prefix = if is_private {
-        STORE_PREFIX_INT_PRIVATE
-    } else if is_international {
-        STORE_PREFIX_INT
-    } else {
-        STORE_PREFIX
-    };
 
     // h1 check
     let heading_sel =
@@ -253,28 +344,19 @@ fn fetch_page_sellers(
         }
     }
 
-    Ok(entries
-        .into_iter()
-        .filter(|e| e.item_count > 0 && !shipping::is_blacklisted(&e.name))
-        .map(|e| {
-            let mut price_oere = (e.price_eur_cents as f64 * EUR_TO_NOK).round() as u32;
-            if is_international {
-                price_oere = (price_oere as f64 * VAT_MULTIPLIER).round() as u32;
-            }
-            StoreResult {
-                store_name: format!("{}: {}", store_prefix, e.name),
-                card_name: card_name.to_string(),
-                price: price_oere,
-                url: e.url,
-            }
-        })
-        .collect())
+    Ok(sellers_to_results(
+        entries,
+        card_name,
+        is_international,
+        is_private,
+    ))
 }
 
 // ── Fetch with load-more support ───────────────────────────────────────────
 
 fn fetch_all_sellers(
-    client: &reqwest::blocking::Client,
+    client: &wreq::Client,
+    rt: &tokio::runtime::Runtime,
     url: &str,
     card_name: &str,
     filter_settings: &str,
@@ -282,22 +364,32 @@ fn fetch_all_sellers(
     is_private: bool,
     verbose: bool,
 ) -> anyhow::Result<Vec<StoreResult>> {
-    let response = client
-        .get(url)
-        .header(
-            reqwest::header::REFERER,
-            "https://www.cardmarket.com/en/Magic",
-        )
-        .send()
-        .context("GET card page failed")?;
-    if !response.status().is_success() {
-        anyhow::bail!("CardMarket returned HTTP {}", response.status().as_u16());
+    if verbose {
+        eprintln!("  [cardmarket] GET {url}");
     }
-    let html = response.text().context("Failed to read page body")?;
+    let response = rt
+        .block_on(client.get(url).send())
+        .context("GET card page failed")?;
+    if verbose {
+        eprintln!("  [cardmarket] <- HTTP {} ", response.status());
+        for (name, value) in response.headers() {
+            eprintln!("  [cardmarket]   {name}: {value:?}");
+        }
+    }
+    let status = response.status();
+    let html = rt
+        .block_on(response.text())
+        .context("Failed to read page body")?;
 
-    // Detect Cloudflare challenge page
+    // Check for Cloudflare challenge before rejecting on status code
     if html.contains("challenges.cloudflare.com") || html.contains("_cf_chl_opt") {
+        let prefix = store_prefix_from_flags(is_international, is_private);
+        queue_rescue(card_name, prefix, url);
         anyhow::bail!("Cloudflare challenge detected — try again later or from a different IP");
+    }
+
+    if !status.is_success() {
+        anyhow::bail!("CardMarket returned HTTP {}", status.as_u16());
     }
 
     let document = Html::parse_document(&html);
@@ -315,15 +407,19 @@ fn fetch_all_sellers(
             ("filterSettings", filter_settings),
             ("idMetacard", id_str.as_str()),
         ];
-        let resp = client
-            .post(AJAX_URL)
-            .form(&form)
-            .header("Referer", url)
-            .header("Origin", "https://www.cardmarket.com")
-            .send()
+        let resp = rt
+            .block_on(
+                client
+                    .post(AJAX_URL)
+                    .form(&form)
+                    .header("Referer", url)
+                    .header("Origin", "https://www.cardmarket.com")
+                    .send(),
+            )
             .context("POST load more failed")?;
-        let ajax_html = resp.text().context("Failed to read AJAX response")?;
-        // The AJAX response is XML with base64-encoded HTML in <rows>
+        let ajax_html = rt
+            .block_on(resp.text())
+            .context("Failed to read AJAX response")?;
         let decoded = if let Some(rows) = extract_ajax_rows(&ajax_html) {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(rows)
@@ -359,15 +455,37 @@ fn fetch_all_sellers(
         }
     }
 
-    let store_prefix = if is_private {
+    Ok(sellers_to_results(
+        all_entries,
+        card_name,
+        is_international,
+        is_private,
+    ))
+}
+
+// ── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Map is_international/is_private flags to a store prefix string.
+fn store_prefix_from_flags(is_international: bool, is_private: bool) -> &'static str {
+    if is_private {
         STORE_PREFIX_INT_PRIVATE
     } else if is_international {
         STORE_PREFIX_INT
     } else {
         STORE_PREFIX
-    };
+    }
+}
 
-    Ok(all_entries
+/// Convert seller entries to StoreResults with price conversion, VAT, and
+/// store-prefix formatting.
+fn sellers_to_results(
+    entries: Vec<SellerEntry>,
+    card_name: &str,
+    is_international: bool,
+    is_private: bool,
+) -> Vec<StoreResult> {
+    let store_prefix = store_prefix_from_flags(is_international, is_private);
+    entries
         .into_iter()
         .filter(|e| e.item_count > 0 && !shipping::is_blacklisted(&e.name))
         .map(|e| {
@@ -382,7 +500,55 @@ fn fetch_all_sellers(
                 url: e.url,
             }
         })
-        .collect())
+        .collect()
+}
+
+/// JSON shape produced by the browser JS snippet.
+#[derive(Deserialize)]
+struct RescueSellerJson {
+    n: String,
+    p: String,
+    c: u32,
+    u: String,
+}
+
+/// Parse seller JSON from the browser snippet and convert to StoreResults.
+/// Returns `None` if the JSON array is empty (no sellers found on the page).
+pub(crate) fn sellers_from_json(
+    json: &str,
+    card_name: &str,
+    sub_key: &str,
+) -> anyhow::Result<Vec<StoreResult>> {
+    let raw: Vec<RescueSellerJson> =
+        serde_json::from_str(json).context("Failed to parse rescue JSON")?;
+
+    let (is_international, is_private) = match sub_key {
+        STORE_PREFIX => (false, false),
+        STORE_PREFIX_INT => (true, false),
+        STORE_PREFIX_INT_PRIVATE => (true, true),
+        _ => anyhow::bail!("Unknown sub_key: {}", sub_key),
+    };
+
+    let entries: Vec<SellerEntry> = raw
+        .into_iter()
+        .filter(|s| !s.n.is_empty() && !s.p.is_empty())
+        .filter_map(|s| {
+            let price_eur_cents = parse_eur_price(&s.p)?;
+            Some(SellerEntry {
+                name: s.n,
+                price_eur_cents,
+                item_count: s.c,
+                url: s.u,
+            })
+        })
+        .collect();
+
+    Ok(sellers_to_results(
+        entries,
+        card_name,
+        is_international,
+        is_private,
+    ))
 }
 
 fn extract_csrf(document: &scraper::Html) -> anyhow::Result<String> {

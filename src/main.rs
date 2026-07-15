@@ -56,6 +56,17 @@ struct Cli {
     /// Print verbose diagnostics.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Suppress the price summary table after scraping.
+    #[arg(long)]
+    no_summary: bool,
+
+    /// Enter interactive rescue mode when CardMarket is blocked by Cloudflare.
+    /// Failed pages are queued; after all automated fetching finishes, you'll
+    /// be prompted to open each URL in your browser, expand all sellers, run a
+    /// JS snippet in the console, and paste the result back.
+    #[arg(long)]
+    semi_manual: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -220,6 +231,9 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Spawn one thread per store
+    if cli.semi_manual {
+        stores::cardmarket::set_semi_manual(true);
+    }
     let (tx, rx) = mpsc::channel::<StoreResult>();
     let cards_ref = Arc::new(unique_cards);
     let bar = Arc::new(
@@ -247,12 +261,18 @@ fn main() -> anyhow::Result<()> {
             let store_name = store.name().to_string();
             let timeout = Duration::from_secs(store.timeout_secs());
 
-            let store_client = reqwest::blocking::Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                .timeout(timeout)
-                .build()
-                .expect("Failed to build per-store HTTP client");
+            let store_client = {
+                let mut builder = reqwest::blocking::Client::builder()
+                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                    .timeout(timeout);
+                // CardMarket needs cookie_store for CSRF / AJAX load-more
+                if store_name.starts_with("cardmarket") {
+                    builder = builder.cookie_store(true);
+                }
+                builder
+                    .build()
+                    .expect("Failed to build per-store HTTP client")
+            };
 
             let counts = &store_stats[&store_name];
 
@@ -315,8 +335,17 @@ fn main() -> anyhow::Result<()> {
                         match store.search_sub(&store_client, card_name, key) {
                             Ok(sub_results) => {
                                 if sub_results.is_empty() {
-                                    if let Some(ref cache) = cache {
-                                        let _ = cache.store(card_name, key, None);
+                                    // Don't negative-cache if CardMarket is
+                                    // blocked — an empty result here means
+                                    // we gave up, not that there are no
+                                    // sellers.  The semi-manual run needs
+                                    // a clean cache lookup to queue rescues.
+                                    let gave_up = key.starts_with("cardmarket")
+                                        && stores::cardmarket::is_blocked();
+                                    if !gave_up {
+                                        if let Some(ref cache) = cache {
+                                            let _ = cache.store(card_name, key, None);
+                                        }
                                     }
                                 } else {
                                     for result in &sub_results {
@@ -332,13 +361,28 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                             Err(e) => {
-                                counts.failed.fetch_add(1, Ordering::Relaxed);
-                                bar.suspend(|| {
-                                    eprintln!(
-                                        "  [{}] Failed to search '{}': {}",
-                                        key, card_name, e
-                                    );
-                                });
+                                // In semi-manual mode, Cloudflare-blocked
+                                // CardMarket pages are queued for rescue.
+                                if e.downcast_ref::<stores::cardmarket::RescuePending>()
+                                    .is_some()
+                                {
+                                    if verbose {
+                                        bar.suspend(|| {
+                                            eprintln!(
+                                                "  [{}] queued for rescue: '{}'",
+                                                key, card_name
+                                            );
+                                        });
+                                    }
+                                } else {
+                                    counts.failed.fetch_add(1, Ordering::Relaxed);
+                                    bar.suspend(|| {
+                                        eprintln!(
+                                            "  [{}] Failed to search '{}': {}",
+                                            key, card_name, e
+                                        );
+                                    });
+                                }
                             }
                         }
                     }
@@ -362,18 +406,162 @@ fn main() -> anyhow::Result<()> {
         handles.push(handle);
     }
 
-    // Drop the sender so the channel closes when all threads finish
-    drop(tx);
-
-    // Collect all results (buffer to avoid interleaving from slow stores)
-    let all_results: Vec<StoreResult> = rx.into_iter().collect();
-
-    // Wait for all threads to finish
+    // Wait for all store threads to finish (threads drop their tx clones
+    // on exit).  We keep our tx alive for the rescue phase.
     for handle in handles {
         if let Err(e) = handle.join() {
             eprintln!("  [error] Store thread panicked: {:?}", e);
         }
     }
+
+    // ── Semi-manual rescue phase ─────────────────────────────────────────────
+    let mut rescued_count: usize = 0;
+    if cli.semi_manual {
+        let queue = stores::cardmarket::drain_rescue_queue();
+        if !queue.is_empty() {
+            bar.finish_and_clear();
+            eprintln!(
+                "\n=== CardMarket semi-manual rescue: {} page(s) need human help ===\n",
+                queue.len()
+            );
+            eprintln!(
+                "For each URL below:\n\
+                 1. Open the URL in your browser\n\
+                 2. Click \"Show more results\" until all sellers are loaded\n\
+                 3. Press F12 → Console, paste this snippet, press Enter:"
+            );
+            eprintln!("{}", stores::cardmarket::rescue_js_snippet());
+            eprintln!("  Seller data is now on your clipboard.");
+
+            // Detect clipboard tool
+            let clip_cmd: Option<&str> = {
+                let candidates = ["xclip", "wl-paste"];
+                candidates
+                    .iter()
+                    .find(|cmd| {
+                        std::process::Command::new("which")
+                            .arg(cmd)
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false)
+                    })
+                    .copied()
+            };
+
+            for item in &queue {
+                eprintln!(
+                    "[{sub}] {card}\n  {url}",
+                    sub = item.sub_key,
+                    card = item.card_name,
+                    url = item.url
+                );
+
+                eprint!("  Run the JS snippet, then press Enter to read clipboard...");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                {
+                    let mut dummy = String::new();
+                    let _ = std::io::stdin().read_line(&mut dummy);
+                }
+
+                let json: String = if let Some(cmd) = clip_cmd {
+                    let args = if cmd == "xclip" {
+                        vec!["-o", "-selection", "clipboard"]
+                    } else {
+                        vec![]
+                    };
+                    match std::process::Command::new(cmd).args(&args).output() {
+                        Ok(out) if out.status.success() => match String::from_utf8(out.stdout) {
+                            Ok(s) => s.trim().to_string(),
+                            Err(_) => {
+                                eprintln!("  Clipboard content is not valid UTF-8.");
+                                continue;
+                            }
+                        },
+                        _ => {
+                            eprintln!("  Clipboard read failed.");
+                            continue;
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "  No clipboard tool found (install xclip or wl-clipboard).\n\
+                          Type 'skip' to skip, 'quit' to stop, or paste a file path:"
+                    );
+                    eprint!("  > ");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).is_err() {
+                        continue;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.eq_ignore_ascii_case("quit") {
+                        eprintln!("  Rescue aborted.");
+                        break;
+                    }
+                    if trimmed.eq_ignore_ascii_case("skip") {
+                        eprintln!("  Skipped.");
+                        continue;
+                    }
+                    // Try as file path
+                    match std::fs::read_to_string(trimmed) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("  Could not read file: {e}");
+                            continue;
+                        }
+                    }
+                };
+
+                if json.is_empty() {
+                    eprintln!("  Empty clipboard. Run the JS snippet first.");
+                    continue;
+                }
+
+                match stores::cardmarket::sellers_from_json(&json, &item.card_name, &item.sub_key) {
+                    Ok(results) => {
+                        eprintln!("  Got {} seller(s).", results.len());
+                        if results.is_empty() {
+                            if let Some(ref cache) = cache {
+                                let _ = cache.store(&item.card_name, &item.sub_key, None);
+                            }
+                        } else {
+                            for result in &results {
+                                if let Some(ref cache) = cache {
+                                    let _ = cache.store(
+                                        &item.card_name,
+                                        &result.store_name,
+                                        Some(std::slice::from_ref(result)),
+                                    );
+                                }
+                                if tx.send(result.clone()).is_err() {
+                                    break;
+                                }
+                            }
+                            rescued_count += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  Parse error: {e}");
+                    }
+                }
+            }
+
+            if rescued_count > 0 {
+                eprintln!(
+                    "\n  Rescued {rescued} page(s) — re-run the wizard with --semi-manual to include them.",
+                    rescued = rescued_count
+                );
+            }
+        }
+    }
+
+    // Close the channel — all threads + rescue are done.
+    drop(tx);
+
+    // Collect all results (buffer to avoid interleaving from slow stores)
+    let all_results: Vec<StoreResult> = rx.into_iter().collect();
 
     bar.finish_and_clear();
 
@@ -385,7 +573,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Print results as a table
-    output::print_table(&cards_ref, &grouped);
+    if !cli.no_summary {
+        output::print_table(&cards_ref, &grouped);
+    }
 
     // Per-store summary
     eprintln!();
@@ -417,6 +607,12 @@ fn main() -> anyhow::Result<()> {
             parts.push(format!("{} failed", fl));
         }
         eprintln!("  {:<30} {}", name, parts.join(", "));
+    }
+
+    // If CardMarket got blocked, remind the user
+    if stores::cardmarket::is_blocked() {
+        eprintln!();
+        eprintln!("  ⚠ CardMarket is blocking fetch attempts. Try from a different IP.");
     }
 
     Ok(())
