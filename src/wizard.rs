@@ -5,11 +5,11 @@
 //! - **Cheapest**: minimize total cost (penalizing each extra store by ~50 kr).
 //!
 //! Two-phase optimization:
-//! 1. **Multi-start hill climbing** (30 random restarts) establishes a baseline.
+//! 1. **Multi-start hill climbing** (50 random restarts) establishes a baseline.
 //! 2. **Iterated Local Search (ILS)** perturbs the best solution and re-optimizes,
-//!    using **simulated annealing** to escape local optima.  The Simplest strategy
-//!    also uses store-consolidation perturbations to find fewer-store solutions.
-//!    Stops after 5 consecutive non-improving ILS iterations.
+//!    using **simulated annealing** (~1,360 steps) to escape local optima.  The
+//!    Simplest strategy also uses store-consolidation perturbations to find
+//!    fewer-store solutions.  Stops after 3 consecutive non-improving ILS iters.
 
 use crate::shipping::{self, ShippingInfo};
 use crate::stores::StoreResult;
@@ -191,11 +191,11 @@ const SKIP_PENALTY: u64 = 500000; // 1 skipped card ≈ 5000 kr
 
 /// Initial temperature (in score units).  High enough to accept most worsening
 /// moves early in the cooling schedule; decays geometrically each iteration.
-const SA_INITIAL_TEMP: f64 = 50_000.0;
-/// Per-iteration cooling multiplier.  Closer to 1.0 = slower cooling, more exploration.
-const SA_COOLING_RATE: f64 = 0.999;
+const SA_INITIAL_TEMP: f64 = 30_000.0;
+/// Per-iteration cooling multiplier.  0.997 gives ~1,360 steps from 30k to 500.
+const SA_COOLING_RATE: f64 = 0.997;
 /// Stop when temperature drops below this threshold.
-const SA_MIN_TEMP: f64 = 100.0;
+const SA_MIN_TEMP: f64 = 500.0;
 
 /// Fraction of cards to randomly reassign during an ILS perturbation step.
 const ILS_PERTURB_FRACTION: f64 = 0.30;
@@ -453,9 +453,14 @@ impl ScoredAssignment {
 
 // ── Public result type ───────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct WizardSolution {
     /// Per-card assignment: (card_name, None if skipped, or Some(store, price, url)).
     pub assignments: Vec<(String, Option<(String, u32, String)>)>,
+    /// Raw option indices, parallel to `assignments`.  Used to seed the next
+    /// tolerance level for monotonic cost guarantees.
+    #[allow(dead_code)]
+    pub(crate) raw_choices: Vec<Option<usize>>,
     /// Store names used (sorted).
     pub store_names: Vec<String>,
     /// Card subtotal per store (parallel to store_names).
@@ -477,30 +482,165 @@ pub struct WizardSolution {
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
+/// Rough evaluations-per-second used for time estimates.
+const EVALS_PER_SEC: f64 = 5_000_000.0;
+
+/// Exhaustively enumerate all possible store assignments to find the
+/// **provably optimal** solution.  Each card is assigned to one of its
+/// available stores (using the cheapest listing at that store) or skipped.
+///
+/// Memory is bounded (O(cards) stack + one scored assignment at a time),
+/// but CPU time grows as ~(S+1)^C for S stores per card and C cards.
+/// Prints a warning for large search spaces so the user can Ctrl-C.
+fn optimize_exhaustive(input: &WizardInput, config: &WizardConfig) -> Option<WizardSolution> {
+    let n = input.card_count();
+    let n_stores = input.store_names.len();
+
+    let available: Vec<Vec<Option<usize>>> = input
+        .cards
+        .iter()
+        .map(|card| {
+            let mut stores: Vec<Option<usize>> =
+                card.options.iter().map(|o| Some(o.store_idx)).collect();
+            stores.sort();
+            stores.dedup();
+            stores.push(None);
+            stores
+        })
+        .collect();
+
+    let space_size: f64 = available.iter().map(|a| a.len() as f64).product();
+    let est_secs = space_size / EVALS_PER_SEC;
+
+    if est_secs > 10.0 {
+        let est_str = if est_secs < 120.0 {
+            format!("{est_secs:.0}s")
+        } else if est_secs < 7200.0 {
+            format!("{:.0}s = {:.0}m", est_secs, est_secs / 60.0)
+        } else {
+            format!("{:.0}s = {:.1}h", est_secs, est_secs / 3600.0)
+        };
+        eprintln!(
+            "  [exhaustive] {n} cards x {n_stores} stores -> {space_size:.2e} assignments (~{est_str})"
+        );
+        eprintln!(
+            "  [exhaustive] Large search space -- Ctrl-C to abort, or wait for the optimal result."
+        );
+    } else {
+        eprintln!("  [exhaustive] {n} cards x {n_stores} stores -> {space_size:.2e} assignments");
+    }
+
+    let mut best: Option<ScoredAssignment> = None;
+    let mut best_score = u64::MAX;
+    let mut choices: Vec<Option<usize>> = vec![None; n];
+
+    fn recurse(
+        ci: usize,
+        choices: &mut Vec<Option<usize>>,
+        available: &[Vec<Option<usize>>],
+        input: &WizardInput,
+        config: &WizardConfig,
+        best: &mut Option<ScoredAssignment>,
+        best_score: &mut u64,
+    ) {
+        if ci == choices.len() {
+            let raw = Assignment {
+                choices: choices.clone(),
+            };
+            let scored = ScoredAssignment::new(raw, input, config);
+            if scored.score < *best_score {
+                *best_score = scored.score;
+                *best = Some(scored);
+            }
+            return;
+        }
+
+        for &store_opt in &available[ci] {
+            choices[ci] = store_opt;
+            recurse(ci + 1, choices, available, input, config, best, best_score);
+        }
+    }
+
+    recurse(
+        0,
+        &mut choices,
+        &available,
+        input,
+        config,
+        &mut best,
+        &mut best_score,
+    );
+
+    best.map(|a| build_solution(&a, input, config))
+}
+
+/// Reconstruct a `WizardSolution` from stored `raw_choices`.
+/// Used to display a previous run's solution that beat the current one.
+pub(crate) fn solution_from_choices(
+    choices: &[Option<usize>],
+    input: &WizardInput,
+    config: &WizardConfig,
+) -> WizardSolution {
+    let raw = Assignment {
+        choices: choices.to_vec(),
+    };
+    let scored = ScoredAssignment::new(raw, input, config);
+    build_solution(&scored, input, config)
+}
+
 /// Run the optimizer on a pre-built input.
 ///
-/// **Phase 1 — Multi-start hill climbing**: 30 random restarts establish a
-/// strong baseline solution.
+/// If `exhaustive` is true and the problem is small enough (<= 12 cards),
+/// exhaustively enumerates all assignments for the provably optimal result.
+/// Otherwise:
 ///
-/// **Phase 2 — Iterated Local Search (ILS)**: perturb the best solution,
-/// hill-climb, then escape local optima with simulated annealing.  Runs up
-/// to 20 ILS iterations, stopping early after 5 consecutive non-improvements.
+/// **Phase 1 — Multi-start hill climbing**: 50 random restarts.
+/// **Phase 2 — Iterated Local Search + Simulated Annealing**: up to 12
+/// iterations, stopping after 3 consecutive non-improvements.
 ///
-/// For the **Simplest** strategy, perturbations alternate between scattering
-/// (random reassignment) and consolidating (merging one store into others),
-/// since reducing store count is the primary objective.
-///
-/// Returns the best solution found, or `None` if all cards must be skipped
-/// (e.g. tolerance too low and skip-penalty dominates).
-pub(crate) fn optimize_input(input: &WizardInput, config: &WizardConfig) -> Option<WizardSolution> {
+/// Simplest strategy also uses store-consolidation perturbations.
+pub(crate) fn optimize_input(
+    input: &WizardInput,
+    config: &WizardConfig,
+    exhaustive: bool,
+    seed: Option<&[Option<usize>]>,
+) -> Option<WizardSolution> {
+    if exhaustive {
+        let solution = optimize_exhaustive(input, config);
+        if solution.is_some() {
+            return solution;
+        }
+    }
+
     let mut rng = rand::thread_rng();
     let mut best: Option<ScoredAssignment> = None;
     let mut best_score: Option<u64> = None;
 
+    // If seeded from a previous tolerance, use it as a candidate.
+    // This guarantees the cost can only go down (or stay equal) as
+    // tolerance increases.
+    if let Some(choices) = seed {
+        let raw = Assignment {
+            choices: choices.to_vec(),
+        };
+        let mut current = ScoredAssignment::new(raw, input, config);
+        loop {
+            let neighbor = best_neighbor(&current, input, config);
+            match neighbor {
+                Some(n) if n.score < current.score => {
+                    current = n;
+                }
+                _ => break,
+            }
+        }
+        best_score = Some(current.score);
+        best = Some(current);
+    }
+
     // ── Phase 1: Multi-start hill climbing ──────────────────────────────
-    let num_restarts = 30;
-    for seed in 0..num_restarts {
-        let raw = initial_assignment(input, config, seed);
+    let num_restarts = 50;
+    for seed_idx in 0..num_restarts {
+        let raw = initial_assignment(input, config, seed_idx);
         let mut current = ScoredAssignment::new(raw, input, config);
 
         loop {
@@ -521,11 +661,11 @@ pub(crate) fn optimize_input(input: &WizardInput, config: &WizardConfig) -> Opti
 
     // ── Phase 2: Iterated Local Search ──────────────────────────────────
     let mut current_best = best.clone().expect("phase 1 always produces a solution");
-    let ils_iterations = 20;
+    let ils_iterations = 12;
     let mut no_improve = 0u32;
 
     for i in 0..ils_iterations {
-        if no_improve >= 5 {
+        if no_improve >= 3 {
             break;
         }
 
@@ -694,6 +834,72 @@ fn best_neighbor(
         }
     }
 
+    // Build the best result seen so far from the best single-card move (Move 1).
+    // Subsequent move types (swap, consolidate, bulk-merge) compete against this.
+    let mut best_result: Option<ScoredAssignment> = best_move.map(|(ci, new_oi)| {
+        let mut nb = current.clone();
+        nb.apply_single_move(ci, new_oi, input, config);
+        nb
+    });
+    let mut best_score = best_result.as_ref().map_or(current.score, |r| r.score);
+
+    // ── Move 1.5: Swap cards between different stores (Cheapest only) ────
+    // Swap ci at store A with cj at store B in one atomic step.
+    // Single-card moves can't express this because each intermediate state
+    // (move ci first, or cj first) may look worse even when the combined
+    // swap is beneficial.  Skipped for Simplest — consolidation matters more.
+    //
+    // Bounded to store pairs with ≤ 10 cards each to keep O(K²) manageable.
+    if !matches!(config.strategy, Strategy::Simplest) {
+        const SWAP_MAX_PER_STORE: usize = 10;
+
+        let card_store: Vec<Option<usize>> = current
+            .choices
+            .iter()
+            .enumerate()
+            .map(|(ci, &oi)| oi.map(|oi| input.cards[ci].options[oi].store_idx))
+            .collect();
+
+        let mut cards_at: Vec<Vec<usize>> = vec![Vec::new(); input.store_names.len()];
+        for (ci, &si_opt) in card_store.iter().enumerate() {
+            if let Some(si) = si_opt {
+                if current.store_card_counts[si] <= SWAP_MAX_PER_STORE {
+                    cards_at[si].push(ci);
+                }
+            }
+        }
+
+        for si in 0..input.store_names.len() {
+            if cards_at[si].is_empty() {
+                continue;
+            }
+            for sj in (si + 1)..input.store_names.len() {
+                if cards_at[sj].is_empty() {
+                    continue;
+                }
+                for &ci in &cards_at[si] {
+                    let ci_at_sj = match input.cheapest_at[ci][sj] {
+                        Some((oi, _)) => Some(oi),
+                        None => continue,
+                    };
+                    for &cj in &cards_at[sj] {
+                        let cj_at_si = match input.cheapest_at[cj][si] {
+                            Some((oi, _)) => Some(oi),
+                            None => continue,
+                        };
+                        let mut nb = current.clone();
+                        nb.apply_single_move(ci, ci_at_sj, input, config);
+                        nb.apply_single_move(cj, cj_at_si, input, config);
+                        if nb.score < best_score {
+                            best_score = nb.score;
+                            best_result = Some(nb);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ── Move 2: Consolidate small stores (delta scoring, O(1) per candidate) ─
     let small_stores: Vec<usize> = current
         .store_card_counts
@@ -713,16 +919,22 @@ fn best_neighbor(
                     if alt_opt.store_idx == from_si {
                         continue;
                     }
+                    // Fast O(1) delta check before cloning.
                     let delta = current.try_single_move_delta(ci, Some(alt_oi), input, config);
-                    if delta < best_delta {
-                        best_delta = delta;
-                        best_move = Some((ci, Some(alt_oi)));
+                    if (current.score as i64 + delta) < (best_score as i64) {
+                        let mut nb = current.clone();
+                        nb.apply_single_move(ci, Some(alt_oi), input, config);
+                        best_score = nb.score;
+                        best_result = Some(nb);
                     }
                 }
+                // Try skipping the card instead.
                 let delta = current.try_single_move_delta(ci, None, input, config);
-                if delta < best_delta {
-                    best_delta = delta;
-                    best_move = Some((ci, None));
+                if (current.score as i64 + delta) < (best_score as i64) {
+                    let mut nb = current.clone();
+                    nb.apply_single_move(ci, None, input, config);
+                    best_score = nb.score;
+                    best_result = Some(nb);
                 }
             }
         }
@@ -741,15 +953,6 @@ fn best_neighbor(
         .filter(|&(_, &c)| c > 0)
         .map(|(si, _)| si)
         .collect();
-
-    // Apply best single-card move first so Move 3 competes against the
-    // improved result.
-    let mut best_result: Option<ScoredAssignment> = best_move.map(|(ci, new_oi)| {
-        let mut nb = current.clone();
-        nb.apply_single_move(ci, new_oi, input, config);
-        nb
-    });
-    let mut best_score = best_result.as_ref().map_or(current.score, |r| r.score);
 
     for &from_si in &used_stores {
         for &to_si in &used_stores {
@@ -1050,6 +1253,7 @@ fn build_solution(
 
     WizardSolution {
         assignments,
+        raw_choices: scored.choices.clone(),
         store_names,
         card_subtotals,
         shipping_costs,

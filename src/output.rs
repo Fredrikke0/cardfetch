@@ -1,3 +1,4 @@
+use crate::cache::WizardHistory;
 use crate::stores::StoreResult;
 use crate::wizard::WizardSolution;
 use std::collections::{BTreeMap, HashMap};
@@ -398,11 +399,13 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
 // ── Wizard output ────────────────────────────────────────────────────────────
 
 /// Print a compact summary table for all tolerances 0..N, then the full
-/// breakdown for the max-tolerance solution.
+/// breakdown for the max-tolerance solution.  Compares against `prev_history`
+/// (state before this run) and marks new personal bests with "(new best!)".
 pub fn print_wizard_summary(
     solutions: &[(usize, WizardSolution)],
     strategy: &str,
     wanted_cards: &[String],
+    prev_history: &HashMap<usize, WizardHistory>,
 ) {
     let strategy_label = match strategy {
         "simplest" => "Simplest",
@@ -430,26 +433,46 @@ pub fn print_wizard_summary(
 
     // ── Summary table ──────────────────────────────────────────────────
     println!(
-        "  {:>9}  {:>6}  {:>5}  {:>6}  {:>9}  {:>8}  {:>10}  {:>9}",
-        "Tolerance", "Stores", "Found", "Skipped", "Cards", "Shipping", "Total", "Per card"
+        "  {:>9}  {:>6}  {:>5}  {:>6}  {:>9}  {:>8}  {:>14}  {:>9}  {:>14}",
+        "Tolerance",
+        "Stores",
+        "Found",
+        "Skipped",
+        "Cards",
+        "Shipping",
+        "Total",
+        "Per card",
+        "vs prev"
     );
-    let sep = "\u{2500}".repeat(79);
+    let sep = "\u{2500}".repeat(101);
     println!("  {sep}");
 
     for (t, sol) in solutions {
         let found = total_cards - sol.skipped.len();
         let grand = sol.total_card_cost + sol.total_shipping;
         let avg = if found > 0 { grand / found as u64 } else { 0 };
+
+        let total_str = format_price_u64(grand);
+        let delta_str = match prev_history.get(t) {
+            Some(prev) if grand < prev.total_cost => {
+                let saved = prev.total_cost.saturating_sub(grand);
+                format!("-{}", format_price_u64(saved))
+            }
+            Some(_) => "\u{2014}".to_string(),
+            None => "\u{2014} (new!)".to_string(),
+        };
+
         println!(
-            "  {:>9}  {:>6}  {:>5}  {:>6}  {:>9}  {:>8}  {:>10}  {:>9}",
+            "  {:>9}  {:>6}  {:>5}  {:>6}  {:>9}  {:>8}  {:>14}  {:>9}  {:>14}",
             t,
             sol.num_stores,
             format!("{}/{}", found, total_cards),
             sol.skipped.len(),
             format_price_u64(sol.total_card_cost),
             format_price_u64(sol.total_shipping),
-            format_price_u64(grand),
+            total_str,
             format_price_u64(avg),
+            delta_str,
         );
     }
     println!();

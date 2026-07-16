@@ -67,6 +67,11 @@ struct Cli {
     /// JS snippet in the console, and paste the result back.
     #[arg(long)]
     semi_manual: bool,
+
+    /// Use exhaustive search (only for <= 12 cards).  Enumerates every
+    /// possible store assignment to guarantee the optimal solution.
+    #[arg(long)]
+    exhaustive: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -120,6 +125,10 @@ fn main() -> anyhow::Result<()> {
             Strategy::Cheapest => "cheapest",
         };
 
+        // Prune solutions computed on stale data and reset current-run flags.
+        cache.prune_stale_solutions()?;
+        cache.clear_current_solutions(strategy_name)?;
+
         // Build input once — warn about uncached cards once.
         let input = wizard::WizardInput::from_results_and_wants(
             listings,
@@ -151,13 +160,16 @@ fn main() -> anyhow::Result<()> {
         );
 
         let mut solutions: Vec<(usize, wizard::WizardSolution)> = Vec::new();
+        let mut prev_choices: Option<Vec<Option<usize>>> = None;
         for t in 0..=cli.tolerance {
             let config = WizardConfig {
                 strategy: cli.strategy,
                 tolerance: t,
                 eu_destination: cli.eu_destination,
             };
-            if let Some(sol) = wizard::optimize_input(&input, &config) {
+            let seed = prev_choices.as_deref();
+            if let Some(sol) = wizard::optimize_input(&input, &config, cli.exhaustive, seed) {
+                prev_choices = Some(sol.raw_choices.clone());
                 solutions.push((t, sol));
             }
             bar.inc(1);
@@ -167,7 +179,75 @@ fn main() -> anyhow::Result<()> {
         if solutions.is_empty() {
             eprintln!("No valid solutions found.");
         } else {
-            output::print_wizard_summary(&solutions, strategy_name, &unique_cards);
+            let total_cards = unique_cards.len();
+
+            // Load previous bests from BOTH strategies — a great Simplest
+            // solution is also a valid (and often great) Cheapest solution.
+            let other_strategy = match strategy_name {
+                "cheapest" => "simplest",
+                "simplest" => "cheapest",
+                _ => strategy_name,
+            };
+            let mut prev_history = cache.load_best_solutions(strategy_name)?;
+            let other_history = cache.load_best_solutions(other_strategy)?;
+            // Merge: for each tolerance, keep whichever strategy's record has
+            // the lower total_cost.
+            for (t, rec) in other_history {
+                match prev_history.get(&t) {
+                    Some(existing) if rec.total_cost < existing.total_cost => {
+                        prev_history.insert(t, rec);
+                    }
+                    None => {
+                        prev_history.insert(t, rec);
+                    }
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "  [wizard] {} previous solutions on record (both strategies)",
+                prev_history.len()
+            );
+
+            // Save only if current beats previous (or no previous exists).
+            // Then build the merged display list.
+            let mut merged: Vec<(usize, wizard::WizardSolution)> = Vec::new();
+            for (t, cur_sol) in &solutions {
+                let found = total_cards - cur_sol.skipped.len();
+                let cur_total = cur_sol.total_card_cost + cur_sol.total_shipping;
+
+                let is_better = match prev_history.get(t) {
+                    Some(prev) => cur_total < prev.total_cost,
+                    None => true, // no previous record
+                };
+
+                if is_better {
+                    cache.save_wizard_solution(
+                        strategy_name,
+                        *t,
+                        cur_sol.num_stores,
+                        found,
+                        cur_sol.skipped.len(),
+                        cur_sol.total_card_cost,
+                        cur_sol.total_shipping,
+                        cur_total,
+                        &cur_sol.raw_choices,
+                    )?;
+                    merged.push((*t, cur_sol.clone()));
+                } else {
+                    // Previous solution is better — reconstruct and display it.
+                    let prev = prev_history.get(t).unwrap();
+                    let config = WizardConfig {
+                        strategy: cli.strategy,
+                        tolerance: *t,
+                        eu_destination: cli.eu_destination,
+                    };
+                    let reconstructed =
+                        wizard::solution_from_choices(&prev.raw_choices, &input, &config);
+                    merged.push((*t, reconstructed));
+                }
+            }
+
+            output::print_wizard_summary(&merged, strategy_name, &unique_cards, &prev_history);
         }
 
         eprintln!(
