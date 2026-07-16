@@ -4,11 +4,16 @@
 //! - **Simplest**: minimize number of stores (treating ~500 kr as equivalent to 1 store).
 //! - **Cheapest**: minimize total cost (penalizing each extra store by ~50 kr).
 //!
-//! Uses multi-start local search (hill-climbing) with 30 random restarts.
-//! Returns the top 3 distinct solutions.
+//! Two-phase optimization:
+//! 1. **Multi-start hill climbing** (30 random restarts) establishes a baseline.
+//! 2. **Iterated Local Search (ILS)** perturbs the best solution and re-optimizes,
+//!    using **simulated annealing** to escape local optima.  The Simplest strategy
+//!    also uses store-consolidation perturbations to find fewer-store solutions.
+//!    Stops after 5 consecutive non-improving ILS iterations.
 
 use crate::shipping::{self, ShippingInfo};
 use crate::stores::StoreResult;
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -181,6 +186,19 @@ impl WizardInput {
 const PRICE_WEIGHT: u64 = 50000; // 1 store ≈ 500 kr in "simplest"
 const STORE_PENALTY: u64 = 5000; // 1 extra store costs 50 kr in "cheapest"
 const SKIP_PENALTY: u64 = 500000; // 1 skipped card ≈ 5000 kr
+
+// ── Simulated annealing parameters ───────────────────────────────────────────
+
+/// Initial temperature (in score units).  High enough to accept most worsening
+/// moves early in the cooling schedule; decays geometrically each iteration.
+const SA_INITIAL_TEMP: f64 = 50_000.0;
+/// Per-iteration cooling multiplier.  Closer to 1.0 = slower cooling, more exploration.
+const SA_COOLING_RATE: f64 = 0.999;
+/// Stop when temperature drops below this threshold.
+const SA_MIN_TEMP: f64 = 100.0;
+
+/// Fraction of cards to randomly reassign during an ILS perturbation step.
+const ILS_PERTURB_FRACTION: f64 = 0.30;
 
 /// Lightweight assignment: which option was chosen for each card.
 /// Used only to build the initial assignment; the optimizer works with
@@ -460,13 +478,28 @@ pub struct WizardSolution {
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /// Run the optimizer on a pre-built input.
+///
+/// **Phase 1 — Multi-start hill climbing**: 30 random restarts establish a
+/// strong baseline solution.
+///
+/// **Phase 2 — Iterated Local Search (ILS)**: perturb the best solution,
+/// hill-climb, then escape local optima with simulated annealing.  Runs up
+/// to 20 ILS iterations, stopping early after 5 consecutive non-improvements.
+///
+/// For the **Simplest** strategy, perturbations alternate between scattering
+/// (random reassignment) and consolidating (merging one store into others),
+/// since reducing store count is the primary objective.
+///
 /// Returns the best solution found, or `None` if all cards must be skipped
 /// (e.g. tolerance too low and skip-penalty dominates).
 pub(crate) fn optimize_input(input: &WizardInput, config: &WizardConfig) -> Option<WizardSolution> {
+    let mut rng = rand::thread_rng();
     let mut best: Option<ScoredAssignment> = None;
     let mut best_score: Option<u64> = None;
 
-    for seed in 0..30 {
+    // ── Phase 1: Multi-start hill climbing ──────────────────────────────
+    let num_restarts = 30;
+    for seed in 0..num_restarts {
         let raw = initial_assignment(input, config, seed);
         let mut current = ScoredAssignment::new(raw, input, config);
 
@@ -482,7 +515,72 @@ pub(crate) fn optimize_input(input: &WizardInput, config: &WizardConfig) -> Opti
 
         if best_score.is_none_or(|s| current.score < s) {
             best_score = Some(current.score);
-            best = Some(current);
+            best = Some(current.clone());
+        }
+    }
+
+    // ── Phase 2: Iterated Local Search ──────────────────────────────────
+    let mut current_best = best.clone().expect("phase 1 always produces a solution");
+    let ils_iterations = 20;
+    let mut no_improve = 0u32;
+
+    for i in 0..ils_iterations {
+        if no_improve >= 5 {
+            break;
+        }
+
+        // Perturb the best-so-far.
+        // For Simplest: alternate scattering and consolidating.
+        // For Cheapest: always scatter (explore different cost profiles).
+        let mut candidate = match config.strategy {
+            Strategy::Simplest if i % 2 == 0 => {
+                // Even iterations: try consolidating a store
+                perturb_consolidate(&current_best, input, config, &mut rng)
+                    .unwrap_or_else(|| perturb(&current_best, input, config, &mut rng))
+            }
+            _ => perturb(&current_best, input, config, &mut rng),
+        };
+
+        // Hill-climb from the perturbed starting point.
+        loop {
+            let neighbor = best_neighbor(&candidate, input, config);
+            match neighbor {
+                Some(n) if n.score < candidate.score => {
+                    candidate = n;
+                }
+                _ => break,
+            }
+        }
+
+        // Use simulated annealing to escape the local optimum.
+        // Skip SA for Simplest when consolidating — the consolidation already
+        // provides a strong structural change, and SA's single-card random walk
+        // tends to re-scatter cards across stores.
+        let sa_candidate = match config.strategy {
+            Strategy::Simplest if i % 2 == 0 => candidate,
+            _ => simulated_annealing(&candidate, input, config, &mut rng),
+        };
+
+        // Hill-climb again from wherever SA ended up.
+        let mut final_candidate = sa_candidate;
+        loop {
+            let neighbor = best_neighbor(&final_candidate, input, config);
+            match neighbor {
+                Some(n) if n.score < final_candidate.score => {
+                    final_candidate = n;
+                }
+                _ => break,
+            }
+        }
+
+        // Keep if improved.
+        if final_candidate.score < best_score.unwrap() {
+            best_score = Some(final_candidate.score);
+            best = Some(final_candidate.clone());
+            current_best = final_candidate;
+            no_improve = 0;
+        } else {
+            no_improve += 1;
         }
     }
 
@@ -691,6 +789,196 @@ fn best_neighbor(
     }
 
     best_result
+}
+
+// ── Simulated annealing ──────────────────────────────────────────────────────
+
+/// Pick a uniformly-random single-card move that differs from the current choice.
+fn random_move(
+    current: &ScoredAssignment,
+    input: &WizardInput,
+    rng: &mut impl Rng,
+) -> (usize, Option<usize>) {
+    let n = input.card_count();
+    let ci = rng.gen_range(0..n);
+    let card = &input.cards[ci];
+    let cur = current.choices[ci];
+
+    // Total distinct choices: every available option + skip
+    let total_choices = card.options.len() + 1;
+    if total_choices <= 1 {
+        return (ci, cur); // no alternative
+    }
+
+    loop {
+        let pick = rng.gen_range(0..total_choices);
+        let new_oi = if pick < card.options.len() {
+            Some(pick)
+        } else {
+            None // skip
+        };
+        if new_oi != cur {
+            return (ci, new_oi);
+        }
+    }
+}
+
+/// Run simulated annealing starting from `initial`.  Accepts worsening moves
+/// with probability exp(-Δ/T) where T starts at `SA_INITIAL_TEMP` and decays
+/// geometrically.  Returns the best assignment encountered during the walk.
+fn simulated_annealing(
+    initial: &ScoredAssignment,
+    input: &WizardInput,
+    config: &WizardConfig,
+    rng: &mut impl Rng,
+) -> ScoredAssignment {
+    let mut current = initial.clone();
+    let mut best = current.clone();
+    let mut best_score = best.score;
+    let mut temp = SA_INITIAL_TEMP;
+
+    while temp > SA_MIN_TEMP {
+        let (ci, new_oi) = random_move(&current, input, rng);
+        if new_oi == current.choices[ci] {
+            // no-op (card has no alternatives); skip this iteration
+            temp *= SA_COOLING_RATE;
+            continue;
+        }
+
+        let delta = current.try_single_move_delta(ci, new_oi, input, config) as f64;
+
+        // Accept if improving, or probabilistically if worsening
+        if delta <= 0.0 || rng.gen::<f64>() < (-delta / temp).exp() {
+            current.apply_single_move(ci, new_oi, input, config);
+            if current.score < best_score {
+                best_score = current.score;
+                best = current.clone();
+            }
+        }
+
+        temp *= SA_COOLING_RATE;
+    }
+
+    best
+}
+
+// ── Iterated Local Search (ILS) ──────────────────────────────────────────────
+
+/// Perturb an assignment by randomly reassigning a fraction of cards to
+/// different options (including skipping), producing a new starting point
+/// for another hill-climb.
+fn perturb(
+    current: &ScoredAssignment,
+    input: &WizardInput,
+    config: &WizardConfig,
+    rng: &mut impl Rng,
+) -> ScoredAssignment {
+    let mut perturbed = current.clone();
+    let n = input.card_count();
+    let perturb_count = ((n as f64) * ILS_PERTURB_FRACTION).ceil() as usize;
+
+    // Pick perturb_count distinct card indices via Fisher-Yates partial shuffle.
+    let mut indices: Vec<usize> = (0..n).collect();
+    for i in 0..perturb_count.min(n) {
+        let j = rng.gen_range(i..n);
+        indices.swap(i, j);
+    }
+
+    for &ci in &indices[..perturb_count.min(n)] {
+        let card = &input.cards[ci];
+        let cur = perturbed.choices[ci];
+        let total_choices = card.options.len() + 1;
+
+        if total_choices <= 1 {
+            continue;
+        }
+
+        loop {
+            let pick = rng.gen_range(0..total_choices);
+            let new_oi = if pick < card.options.len() {
+                Some(pick)
+            } else {
+                None
+            };
+            if new_oi != cur {
+                perturbed.apply_single_move(ci, new_oi, input, config);
+                break;
+            }
+        }
+    }
+
+    perturbed
+}
+
+/// Strategy-aware perturbation for the **Simplest** strategy: pick a random
+/// store and move all its cards to their cheapest alternative at a *different*
+/// store.  This directly reduces the store count by one, which is exactly
+/// what the Simplest score function rewards.
+///
+/// Returns `None` if no consolidation is possible (only one store used, or
+/// no cards can be relocated).
+fn perturb_consolidate(
+    current: &ScoredAssignment,
+    input: &WizardInput,
+    config: &WizardConfig,
+    rng: &mut impl Rng,
+) -> Option<ScoredAssignment> {
+    let n = input.card_count();
+
+    // Pick a random store that currently has cards.
+    let used_stores: Vec<usize> = current
+        .store_card_counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c > 0)
+        .map(|(si, _)| si)
+        .collect();
+
+    if used_stores.len() <= 1 {
+        return None;
+    }
+
+    let from_si = used_stores[rng.gen_range(0..used_stores.len())];
+
+    // Collect card indices assigned to this store.
+    let cards_at_store: Vec<usize> = (0..n)
+        .filter(|&ci| {
+            current.choices[ci].is_some_and(|oi| input.cards[ci].options[oi].store_idx == from_si)
+        })
+        .collect();
+
+    if cards_at_store.is_empty() {
+        return None;
+    }
+
+    let mut result = current.clone();
+    let mut any_moved = false;
+
+    for &ci in &cards_at_store {
+        let card = &input.cards[ci];
+        // Find the cheapest option at any store other than from_si.
+        let mut best_alt: Option<(usize, u32)> = None;
+        for (oi, opt) in card.options.iter().enumerate() {
+            if opt.store_idx != from_si {
+                if best_alt.is_none_or(|(_, p)| opt.price < p) {
+                    best_alt = Some((oi, opt.price));
+                }
+            }
+        }
+
+        if let Some((oi, _)) = best_alt {
+            result.apply_single_move(ci, Some(oi), input, config);
+            any_moved = true;
+        }
+        // Cards with no alternative store stay put (partial consolidation
+        // can still reduce store count if enough cards move).
+    }
+
+    if any_moved {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 // ── Solution bookkeeping ─────────────────────────────────────────────────────

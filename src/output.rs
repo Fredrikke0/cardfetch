@@ -230,10 +230,10 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
     }
 
     // ── Totals ────────────────────────────────────────────────────────
-    let totals: Vec<u32> = (0..store_names.len())
+    let totals: Vec<u64> = (0..store_names.len())
         .map(|i| {
             rows.iter()
-                .filter_map(|r| r.cells[i].0.map(|sr| sr.price))
+                .filter_map(|r| r.cells[i].0.map(|sr| sr.price as u64))
                 .sum()
         })
         .collect();
@@ -243,7 +243,7 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
     for (i, total) in totals.iter().enumerate() {
         print!(" | ");
         if *total > 0 {
-            let s = format_price(*total);
+            let s = format_price_u64(*total);
             print_cell(&s, &s, store_widths[i]);
         } else {
             print_cell("-", "-", store_widths[i]);
@@ -321,7 +321,7 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
 
     // Pick at least one from each non-empty category, then fill remaining
     // slots (up to MAX_SHOWN) by overall ranking.
-    const MAX_SHOWN: usize = 3;
+    const MAX_SHOWN: usize = 1;
 
     let categories: [(&str, &Vec<&str>); 3] = [
         ("Norwegian sellers", &no_sellers),
@@ -353,7 +353,7 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
 
         for seller in &visible {
             let entries = &seller_cards[*seller];
-            let subtotal: u32 = entries.iter().map(|(_, p, _)| p).sum();
+            let subtotal: u64 = entries.iter().map(|(_, p, _)| *p as u64).sum();
             let abbr = abbreviate(seller);
             println!(
                 "  {abbr} ({} card{}):",
@@ -368,15 +368,15 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
             }
             let sep = "-".repeat(max_name + 16);
             println!("    {sep}");
-            println!("    Subtotal: {}", format_price(subtotal));
+            println!("    Subtotal: {}", format_price_u64(subtotal));
         }
 
         let hidden_count = total.saturating_sub(visible.len());
         if hidden_count > 0 {
-            let others_total: u32 = cat_sellers[visible.len()..]
+            let others_total: u64 = cat_sellers[visible.len()..]
                 .iter()
                 .flat_map(|s| seller_cards[*s].iter())
-                .map(|(_, p, _)| p)
+                .map(|(_, p, _)| *p as u64)
                 .sum();
             let others_cards: usize = cat_sellers[visible.len()..]
                 .iter()
@@ -387,7 +387,7 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
                 "  ... and {hidden_count} more seller{} ({} cards, {} total)",
                 if hidden_count == 1 { "" } else { "s" },
                 others_cards,
-                format_price(others_total),
+                format_price_u64(others_total),
             );
         }
     }
@@ -487,7 +487,7 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
         if sol.num_stores == 1 { "" } else { "s" },
         found,
         total_cards,
-        format_price(grand as u32),
+        format_price_u64(grand),
     );
     println!("{sep}");
 
@@ -509,12 +509,12 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
     }
 
     // Build store-index lookup for totals
-    let store_totals: HashMap<&str, (u32, u32)> = sol
+    let store_totals: HashMap<&str, (u64, u64)> = sol
         .store_names
         .iter()
         .zip(sol.card_subtotals.iter())
         .zip(sol.shipping_costs.iter())
-        .map(|((name, &card), &ship)| (name.as_str(), (card, ship)))
+        .map(|((name, &card), &ship)| (name.as_str(), (card as u64, ship as u64)))
         .collect();
 
     // Max card name width for alignment
@@ -538,7 +538,7 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
             .get(store_name.as_str())
             .copied()
             .unwrap_or((0, 0));
-        let st = card_total + shipping;
+        let st: u64 = card_total + shipping;
 
         let abbr = abbreviate(store_name);
         println!();
@@ -558,9 +558,9 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
         println!("    {store_sep}");
         println!(
             "    Card subtotal: {}  |  Shipping: {}  |  Store total: {}",
-            format_price(card_total),
-            format_price(shipping),
-            format_price(st),
+            format_price_u64(card_total),
+            format_price_u64(shipping),
+            format_price_u64(st),
         );
     }
 
@@ -570,9 +570,9 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
     println!("{grand_sep}");
     println!(
         "  GRAND TOTAL: {}  |  Card total: {}  |  Shipping: {}",
-        format_price(grand as u32),
-        format_price(sol.total_card_cost as u32),
-        format_price(sol.total_shipping as u32),
+        format_price_u64(grand),
+        format_price_u64(sol.total_card_cost),
+        format_price_u64(sol.total_shipping),
     );
 
     if !sol.skipped.is_empty() {
