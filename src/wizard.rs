@@ -1695,6 +1695,18 @@ fn optimize_exhaustive(
         merged.append(part);
     }
     merged.sort_by_key(|(_, _, s)| *s);
+    // Deduplicate by card assignment — different store subsets can
+    // produce the same greedy assignment.  Keep only the best-scoring
+    // instance of each unique choice vector.
+    let mut uniq: Vec<Vec<Option<usize>>> = Vec::with_capacity(merged.len());
+    merged.retain(|(_, choices, _)| {
+        if uniq.iter().any(|u| u == choices) {
+            false
+        } else {
+            uniq.push(choices.clone());
+            true
+        }
+    });
     merged.truncate(TOP_N);
 
     bar.finish();
