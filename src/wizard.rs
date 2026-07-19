@@ -310,7 +310,7 @@ impl WizardInput {
 
 /// Scoring constants (in oere).
 pub(crate) const PRICE_WEIGHT: u64 = 50000; // 1 store ≈ 500 kr in "simplest"
-pub(crate) const STORE_PENALTY: u64 = 5000; // 1 extra store costs 50 kr in "cheapest"
+pub(crate) const STORE_PENALTY: u64 = 2000; // 1 extra store costs 20 kr in "cheapest"
 pub(crate) const SKIP_PENALTY: u64 = 500000; // 1 skipped card ≈ 5000 kr
 
 // ── Simulated annealing parameters ───────────────────────────────────────────
