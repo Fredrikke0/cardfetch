@@ -253,9 +253,11 @@ fn main() -> anyhow::Result<()> {
                 strategy: cli.strategy,
                 tolerance: t,
             };
-            if let Some(sol) = wizard::optimize_input(&input, &config, &search_mode) {
+            let results = wizard::optimize_input(&input, &config, &search_mode);
+            if !results.is_empty() {
+                let best = &results[0];
                 // Seed the heuristic path for the next tolerance from whichever
-                // is better: the current run's solution or a previously cached
+                // is better: the current run's best solution or a previously cached
                 // solution at this tolerance.
                 if exhaustive_candidates.is_none() {
                     let seed_choices = match prev_history.get(&t) {
@@ -267,19 +269,21 @@ fn main() -> anyhow::Result<()> {
                                 t,
                                 cli.strategy,
                             );
-                            if prev_score < sol.score {
+                            if prev_score < best.score {
                                 prev.raw_choices.clone()
                             } else {
-                                sol.raw_choices.clone()
+                                best.raw_choices.clone()
                             }
                         }
-                        None => sol.raw_choices.clone(),
+                        None => best.raw_choices.clone(),
                     };
                     search_mode = wizard::SearchMode::Heuristic {
                         seed: Some(seed_choices),
                     };
                 }
-                solutions.push((t, sol));
+                for (_rank, sol) in results.into_iter().enumerate() {
+                    solutions.push((t, sol));
+                }
             }
             bar.inc(1);
         }
@@ -288,10 +292,19 @@ fn main() -> anyhow::Result<()> {
         if solutions.is_empty() {
             eprintln!("No valid solutions found.");
         } else {
-            // Save only if current beats previous (or no previous exists).
-            // Then build the merged display list.
+            // Save all solutions to cache with rank, and build the merged
+            // display list (one row per tolerance — the best solution).
             let mut merged: Vec<(usize, wizard::WizardSolution)> = Vec::new();
+            let mut seen_tol: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            // Track rank within each tolerance group (solutions are already
+            // ordered best-first from optimize_input).
+            let mut tol_rank: std::collections::HashMap<usize, usize> =
+                std::collections::HashMap::new();
+
             for (t, cur_sol) in &solutions {
+                let rank = tol_rank.entry(*t).or_insert(0);
+                *rank += 1; // 1-based rank
+
                 let is_better = match prev_history.get(t) {
                     Some(prev) => {
                         let prev_score = compute_raw_score(
@@ -307,18 +320,32 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 if is_better {
-                    cache.save_wizard_solution(strategy_name, *t, cli.eu_destination, cur_sol)?;
-                    merged.push((*t, cur_sol.clone()));
-                } else {
-                    // Previous solution is better — reconstruct and display it.
-                    let prev = prev_history.get(t).unwrap();
-                    let config = WizardConfig {
-                        strategy: cli.strategy,
-                        tolerance: *t,
-                    };
-                    let reconstructed =
-                        wizard::solution_from_choices(&prev.raw_choices, &input, &config);
-                    merged.push((*t, reconstructed));
+                    cache.save_wizard_solution(
+                        strategy_name,
+                        *t,
+                        cli.eu_destination,
+                        cli.exhaustive,
+                        *rank,
+                        cur_sol,
+                    )?;
+                }
+
+                // Only add the best per tolerance to the display list.
+                if !seen_tol.contains(t) {
+                    seen_tol.insert(*t);
+                    if is_better {
+                        merged.push((*t, cur_sol.clone()));
+                    } else {
+                        // Previous solution is better — reconstruct and display it.
+                        let prev = prev_history.get(t).unwrap();
+                        let config = WizardConfig {
+                            strategy: cli.strategy,
+                            tolerance: *t,
+                        };
+                        let reconstructed =
+                            wizard::solution_from_choices(&prev.raw_choices, &input, &config);
+                        merged.push((*t, reconstructed));
+                    }
                 }
             }
 

@@ -119,15 +119,11 @@ pub(crate) fn rescue_js_snippet() -> &'static str {
 
 pub struct CardMarket {
     _browser: Browser,
-    /// Xvfb child process — kept alive so the virtual display exists while
-    /// the browser runs.  Killed on drop.
     _xvfb: Option<std::process::Child>,
-    /// A single reusable browser tab.  All card searches navigate this
-    /// same tab to avoid leaking tabs in the browser process.
     tab: Arc<headless_chrome::Tab>,
-    /// Per-card cache: once we fetch all three sub-endpoints in one tab
-    /// session, subsequent `search_sub` calls for the same card return
-    /// from here without opening new tabs.
+    /// Serializes access to the single browser tab so concurrent server
+    /// fetch jobs don't race on `navigate_to` / `wait_until_navigated`.
+    tab_lock: Mutex<()>,
     card_cache: Mutex<std::collections::HashMap<String, CardResults>>,
     verbose: bool,
 }
@@ -148,6 +144,10 @@ impl CardMarket {
 
         if let Some(ref d) = display {
             std::env::set_var("DISPLAY", d);
+        } else {
+            // No Xvfb — we're falling back to headless.  Unset DISPLAY so
+            // Chrome doesn't latch onto the real desktop (e.g. :0).
+            std::env::remove_var("DISPLAY");
         }
 
         let launch_opts = LaunchOptions::default_builder()
@@ -157,6 +157,10 @@ impl CardMarket {
             .args(vec![
                 std::ffi::OsStr::new("--disable-dev-shm-usage"),
                 std::ffi::OsStr::new("--disable-blink-features=AutomationControlled"),
+                std::ffi::OsStr::new("--disable-gpu"),
+                std::ffi::OsStr::new("--no-first-run"),
+                std::ffi::OsStr::new("--no-default-browser-check"),
+                std::ffi::OsStr::new("--disable-features=TranslateUI"),
             ])
             .build()
             .expect("Failed to build Chrome launch options");
@@ -168,6 +172,17 @@ impl CardMarket {
 
         // Create one reusable tab that lives for the entire store session.
         let tab = browser.new_tab().expect("Failed to create browser tab");
+
+        // Warm up the tab: Chrome 150's first-run welcome screen can
+        // replace the initial about:blank.  Navigating explicitly to
+        // about:blank and waiting forces the tab into a stable state.
+        // Errors here are not fatal — the tab may still work for the
+        // first real CardMarket navigation.
+        let _ = tab.navigate_to("about:blank");
+        let _ = tab.wait_until_navigated();
+        if verbose {
+            eprintln!("  [cardmarket] tab ready");
+        }
 
         if verbose {
             if display.is_some() {
@@ -181,6 +196,7 @@ impl CardMarket {
             _browser: browser,
             _xvfb: xvfb_child,
             tab,
+            tab_lock: Mutex::new(()),
             card_cache: Mutex::new(std::collections::HashMap::new()),
             verbose,
         }
@@ -201,6 +217,29 @@ impl Drop for CardMarket {
 /// Launch Xvfb on an unused display.  Returns (child_process, display_string).
 fn start_xvfb(verbose: bool) -> (Option<std::process::Child>, Option<String>) {
     use std::process::Command;
+
+    // Kill leftover Xvfb processes from previous runs by checking lock files.
+    for n in 90..=99 {
+        let lock_path = format!("/tmp/.X{n}-lock");
+        if let Ok(lock) = std::fs::read_to_string(&lock_path) {
+            if let Some(pid_str) = lock
+                .lines()
+                .next()
+                .and_then(|l| l.strip_prefix("    ").or(Some(l)).map(|s| s.trim()))
+            {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    let _ = Command::new("kill")
+                        .arg(pid.to_string())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            let _ = std::fs::remove_file(&lock_path);
+        }
+    }
+    // Give killed processes a moment to clean up.
+    std::thread::sleep(std::time::Duration::from_millis(300));
 
     // Try displays 99 down to 90
     for n in (90..=99).rev() {
@@ -260,6 +299,7 @@ impl Store for CardMarket {
         if is_blocked() {
             return Ok(vec![]);
         }
+        let _tab_guard = self.tab_lock.lock().unwrap();
         let slug = title_to_slug(card_name);
         let results = self.fetch_all_in_one_tab(&self.tab, card_name, &slug)?;
         let mut all = results.norwegian;
@@ -277,6 +317,11 @@ impl Store for CardMarket {
         if is_blocked() {
             return Ok(vec![]);
         }
+
+        // Serialize access to the single shared browser tab.  Multiple
+        // concurrent fetch jobs share one CardMarket instance — only
+        // one thread may use the tab at a time.
+        let _tab_guard = self.tab_lock.lock().unwrap();
 
         // Check if we already fetched this card (all 3 sub-endpoints) in one
         // browser session.

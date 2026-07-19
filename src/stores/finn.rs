@@ -43,15 +43,20 @@ impl Store for Finn {
         for doc in &docs {
             std::thread::sleep(Duration::from_millis(super::DELAY_MS));
 
-            let description = match fetch_ad_description(client, &doc.id) {
-                Ok(desc) => desc,
+            let detail = match fetch_ad_detail(client, &doc.id) {
+                Ok(d) => d,
                 Err(_) => {
                     // Non-fatal: skip this ad, try the next one.
                     continue;
                 }
             };
 
-            if title_contains(card_name, &description) {
+            // Skip Pokémon-related listings
+            if detail.description.to_lowercase().contains("pokemon") {
+                continue;
+            }
+
+            if title_contains(card_name, &detail.description) {
                 let price_oere = doc.price_amount().unwrap_or(0);
                 let url = doc
                     .canonical_url
@@ -59,7 +64,7 @@ impl Store for Finn {
                     .unwrap_or_else(|| format!("{}/{}", ITEM_URL, doc.id));
 
                 results.push(StoreResult {
-                    store_name: STORE_NAME.to_string(),
+                    store_name: format!("{}: {}", STORE_NAME, detail.seller_name),
                     card_name: card_name.to_string(),
                     price: price_oere,
                     url,
@@ -94,7 +99,7 @@ impl SearchDoc {
     fn price_amount(&self) -> Option<u32> {
         self.price_raw
             .as_ref()
-            .and_then(|p| u32::try_from(p.amount).ok())
+            .and_then(|p| u32::try_from(p.amount * 100).ok())
     }
 }
 
@@ -174,12 +179,21 @@ fn fetch_search_results(
 
 // ── Ad detail HTML scraping ─────────────────────────────────────────────
 
-/// Fetch an ad page and extract the full description from the rendered HTML.
-fn fetch_ad_description(client: &reqwest::blocking::Client, ad_id: &str) -> anyhow::Result<String> {
+struct AdDetail {
+    description: String,
+    seller_name: String,
+}
+
+/// Fetch an ad page and extract the full description and seller name
+/// from the rendered HTML.
+fn fetch_ad_detail(client: &reqwest::blocking::Client, ad_id: &str) -> anyhow::Result<AdDetail> {
     let url = format!("{}/{}", ITEM_URL, ad_id);
 
     let response = client
         .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "nb-NO,nb;q=0.9,no;q=0.8,en;q=0.7")
         .send()
         .context("Failed to fetch Finn.no ad page")?;
 
@@ -196,13 +210,13 @@ fn fetch_ad_description(client: &reqwest::blocking::Client, ad_id: &str) -> anyh
 
     let document = scraper::Html::parse_document(&html_text);
 
-    // The description lives in: section[data-testid="description"] div.whitespace-pre-wrap
-    let selector =
+    // Extract description
+    let desc_selector =
         scraper::Selector::parse("section[data-testid=\"description\"] div.whitespace-pre-wrap")
             .map_err(|e| anyhow::anyhow!("Invalid CSS selector: {}", e))?;
 
     let texts: Vec<String> = document
-        .select(&selector)
+        .select(&desc_selector)
         .flat_map(|el| el.text())
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
@@ -211,6 +225,80 @@ fn fetch_ad_description(client: &reqwest::blocking::Client, ad_id: &str) -> anyh
     if texts.is_empty() {
         anyhow::bail!("No description element found on ad page");
     }
+    let description = texts.join(" ");
 
-    Ok(texts.join(" "))
+    // Extract seller name from profile link
+    let seller_name = extract_seller_name(&document);
+
+    Ok(AdDetail {
+        description,
+        seller_name,
+    })
+}
+
+/// Try to extract the seller's display name from the ad page.
+/// Tries multiple strategies in order of reliability.
+/// Falls back to "unknown" if no name can be found.
+fn extract_seller_name(document: &scraper::Html) -> String {
+    // Strategy 1: JSON-LD structured data (Product > seller > name)
+    if let Some(name) = extract_from_ld_json(document) {
+        if !name.is_empty() {
+            return name;
+        }
+    }
+
+    // Strategy 2: Profile link in the seller section.
+    // Finn recommence uses href="/profile/ads?userId=..." with the seller name as text.
+    // Scope to links that are inside a profile/seller context by preferring
+    // the more specific "/profile/ads" pattern first.
+    let selectors = [
+        "a[href*='/profile/ads']",
+        "a[href*='/profile/']",
+        "a[href*='/profil/']",
+        "a[href*='/user/']",
+    ];
+    for sel_str in &selectors {
+        if let Ok(sel) = scraper::Selector::parse(sel_str) {
+            for el in document.select(&sel) {
+                let name = el.text().collect::<String>().trim().to_string();
+                if !name.is_empty() && name.len() < 80 {
+                    return name;
+                }
+            }
+        }
+    }
+
+    "unknown".to_string()
+}
+
+/// Try to extract seller name from JSON-LD structured data.
+fn extract_from_ld_json(document: &scraper::Html) -> Option<String> {
+    let sel = scraper::Selector::parse("script[type='application/ld+json']").ok()?;
+
+    for el in document.select(&sel) {
+        let json_str: String = el.text().collect();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+            // Try Product.seller.name
+            if let Some(name) = value
+                .get("seller")
+                .and_then(|s| s.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                return Some(name.to_string());
+            }
+            // Try @graph array (sometimes used for multiple entities)
+            if let Some(graph) = value.get("@graph").and_then(|g| g.as_array()) {
+                for item in graph {
+                    if let Some(name) = item
+                        .get("seller")
+                        .and_then(|s| s.get("name"))
+                        .and_then(|n| n.as_str())
+                    {
+                        return Some(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
 }

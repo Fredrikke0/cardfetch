@@ -148,11 +148,9 @@ fn names_match(searched: &str, product_name: &str) -> bool {
 
 // ── Price parsing ─────────────────────────────────────────────────────────
 
-/// Parse a price string like "6,-" into integer oere.
+/// Parse a price string like "6,-" or "1 799,-" into integer oere.
 fn parse_price(price_str: &str) -> Option<u32> {
-    let trimmed = price_str.trim();
-    // Take leading digits, stop at comma/dash
-    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = price_str.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
         return None;
     }
@@ -188,6 +186,8 @@ mod tests {
         assert_eq!(parse_price("  12,-  "), Some(1200));
         assert_eq!(parse_price("4,-"), Some(400));
         assert_eq!(parse_price("105,-"), Some(10500));
+        assert_eq!(parse_price("1 799,-"), Some(179900));
+        assert_eq!(parse_price("1.799,-"), Some(179900));
         assert_eq!(parse_price(""), None);
         assert_eq!(parse_price("abc"), None);
     }

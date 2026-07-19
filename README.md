@@ -124,6 +124,7 @@ After=network.target
 ExecStart=/path/to/cardfetch --server --port 3000
 Restart=always
 User=cardfetch
+WorkingDirectory=/var/lib/cardfetch
 
 [Install]
 WantedBy=multi-user.target
@@ -147,6 +148,34 @@ WantedBy=multi-user.target
 Results are stored in `cache.db` (SQLite) in the working directory. Subsequent runs hit the cache and skip live fetching for cards that haven't changed. Use `--no-cache` to force a fresh fetch.
 
 The wizard also caches its solutions, so re-running with the same parameters is instant.
+
+## Troubleshooting
+
+### CardMarket errors: "Browser navigation failed"
+
+This means Chrome crashed or can't start. Check:
+
+```bash
+# 1. Chrome installed?
+google-chrome-stable --version   # or: chromium --version
+
+# 2. Kill leftover Xvfb from crashed runs
+pkill Xvfb
+
+# 3. Run with verbose to see what's happening
+cardfetch --server --verbose
+```
+
+If you see **Chrome windows appearing on your desktop** instead of running invisibly, it means Xvfb isn't working. Either:
+- Install Xvfb: `sudo apt install xvfb`
+- Or set `DISPLAY` to empty before starting: `DISPLAY= cardfetch --server`
+
+### Server "Address already in use"
+
+```bash
+# Kill any leftover server process
+pkill -f "cardfetch --server"
+```
 
 ## Architecture
 

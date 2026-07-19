@@ -73,22 +73,24 @@ impl Cache {
                 ON listings(card_name, store_name);
 
             CREATE TABLE IF NOT EXISTS wizard_solutions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                strategy        TEXT NOT NULL,
-                tolerance       INTEGER NOT NULL,
-                eu_destination  INTEGER NOT NULL DEFAULT 0,
-                num_stores      INTEGER NOT NULL,
-                num_found       INTEGER NOT NULL,
-                num_skipped     INTEGER NOT NULL,
-                total_card_cost INTEGER NOT NULL,
-                total_shipping  INTEGER NOT NULL,
-                total_cost      INTEGER NOT NULL,
-                per_card_cost   INTEGER NOT NULL,
-                assignments_json TEXT NOT NULL DEFAULT '[]',
-                created_at      INTEGER NOT NULL,
-                is_current      INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(strategy, tolerance, eu_destination)
-            );
+                            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                            strategy        TEXT NOT NULL,
+                            tolerance       INTEGER NOT NULL,
+                            eu_destination  INTEGER NOT NULL DEFAULT 0,
+                            was_exhaustive  INTEGER NOT NULL DEFAULT 0,
+                            rank            INTEGER NOT NULL DEFAULT 1,
+                            num_stores      INTEGER NOT NULL,
+                            num_found       INTEGER NOT NULL,
+                            num_skipped     INTEGER NOT NULL,
+                            total_card_cost INTEGER NOT NULL,
+                            total_shipping  INTEGER NOT NULL,
+                            total_cost      INTEGER NOT NULL,
+                            per_card_cost   INTEGER NOT NULL,
+                            assignments_json TEXT NOT NULL DEFAULT '[]',
+                            created_at      INTEGER NOT NULL,
+                            is_current      INTEGER NOT NULL DEFAULT 0,
+                            UNIQUE(strategy, tolerance, eu_destination, rank)
+                        );
             CREATE INDEX IF NOT EXISTS idx_wizard_solutions_strat
                 ON wizard_solutions(strategy, tolerance);",
         )
@@ -118,6 +120,63 @@ impl Cache {
                 )
                 .context("Failed to migrate wizard_solutions schema")?;
                 // Existing solutions were computed without --eu-destination, so 0 is correct.
+            }
+        }
+
+        // Migration: add was_exhaustive column if upgrading from older schema.
+        {
+            let has_col: bool = conn
+                .prepare("SELECT was_exhaustive FROM wizard_solutions LIMIT 0")
+                .is_ok();
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE wizard_solutions ADD COLUMN was_exhaustive INTEGER NOT NULL DEFAULT 0;",
+                )
+                .context("Failed to migrate wizard_solutions schema")?;
+                // Existing solutions were heuristic-only, so 0 is correct.
+            }
+        }
+
+        // Migration: add rank column and update unique constraint.
+        {
+            let has_col: bool = conn
+                .prepare("SELECT rank FROM wizard_solutions LIMIT 0")
+                .is_ok();
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE wizard_solutions ADD COLUMN rank INTEGER NOT NULL DEFAULT 1;",
+                )
+                .context("Failed to migrate wizard_solutions schema")?;
+                // Rebuild the table to change the UNIQUE constraint.
+                // SQLite doesn't support ALTER TABLE ... ADD CONSTRAINT,
+                // so we recreate the table.
+                conn.execute_batch(
+                    "CREATE TABLE wizard_solutions_new (
+                        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                        strategy        TEXT NOT NULL,
+                        tolerance       INTEGER NOT NULL,
+                        eu_destination  INTEGER NOT NULL DEFAULT 0,
+                        was_exhaustive  INTEGER NOT NULL DEFAULT 0,
+                        rank            INTEGER NOT NULL DEFAULT 1,
+                        num_stores      INTEGER NOT NULL,
+                        num_found       INTEGER NOT NULL,
+                        num_skipped     INTEGER NOT NULL,
+                        total_card_cost INTEGER NOT NULL,
+                        total_shipping  INTEGER NOT NULL,
+                        total_cost      INTEGER NOT NULL,
+                        per_card_cost   INTEGER NOT NULL,
+                        assignments_json TEXT NOT NULL DEFAULT '[]',
+                        created_at      INTEGER NOT NULL,
+                        is_current      INTEGER NOT NULL DEFAULT 0,
+                        UNIQUE(strategy, tolerance, eu_destination, rank)
+                    );
+                    INSERT INTO wizard_solutions_new SELECT * FROM wizard_solutions;
+                    DROP TABLE wizard_solutions;
+                    ALTER TABLE wizard_solutions_new RENAME TO wizard_solutions;
+                    CREATE INDEX IF NOT EXISTS idx_wizard_solutions_strat
+                        ON wizard_solutions(strategy, tolerance);",
+                )
+                .context("Failed to migrate wizard_solutions unique constraint")?;
             }
         }
 
@@ -298,6 +357,8 @@ impl Cache {
         strategy: &str,
         tolerance: usize,
         eu_destination: bool,
+        was_exhaustive: bool,
+        rank: usize,
         solution: &WizardSolution,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -313,14 +374,17 @@ impl Cache {
 
         conn.execute(
             "INSERT OR REPLACE INTO wizard_solutions
-                (strategy, tolerance, eu_destination, num_stores, num_found, num_skipped,
+                (strategy, tolerance, eu_destination, was_exhaustive, rank,
+                 num_stores, num_found, num_skipped,
                  total_card_cost, total_shipping, total_cost, per_card_cost,
                  assignments_json, created_at, is_current)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
             rusqlite::params![
                 strategy,
                 tolerance as i64,
                 eu_destination as i64,
+                was_exhaustive as i64,
+                rank as i64,
                 solution.num_stores as i64,
                 num_found as i64,
                 solution.skipped.len() as i64,
@@ -446,6 +510,49 @@ impl Cache {
         }
 
         Ok(map)
+    }
+
+    /// Look up all cached wizard solutions for the exact parameters.
+    /// Returns up to TOP_N solutions (ordered by rank, best first) and
+    /// whether they were computed exhaustively.
+    pub fn get_cached_solutions(
+        &self,
+        strategy: &str,
+        tolerance: usize,
+        eu_destination: bool,
+    ) -> anyhow::Result<Vec<(WizardHistory, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT tolerance, num_stores, num_skipped,
+                    total_cost, assignments_json, was_exhaustive
+             FROM wizard_solutions
+             WHERE strategy = ?1 AND tolerance = ?2 AND eu_destination = ?3
+             ORDER BY total_cost ASC",
+        )?;
+
+        let rows: Vec<(WizardHistory, bool)> = stmt
+            .query_map(
+                rusqlite::params![strategy, tolerance as i64, eu_destination as i64],
+                |row| {
+                    let json_str: String = row.get(4)?;
+                    let raw_choices: Vec<Option<usize>> =
+                        serde_json::from_str(&json_str).unwrap_or_default();
+                    Ok((
+                        WizardHistory {
+                            tolerance: row.get::<_, i64>(0)? as usize,
+                            num_stores: row.get::<_, i64>(1)? as usize,
+                            num_skipped: row.get::<_, i64>(2)? as usize,
+                            total_cost: row.get::<_, i64>(3)? as u64,
+                            raw_choices,
+                        },
+                        row.get::<_, i64>(5)? != 0,
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
     }
 }
 

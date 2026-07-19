@@ -196,10 +196,10 @@ fn parse_price(raw: &str) -> Option<u32> {
         .trim()
         .to_string();
 
-    // Take characters until we hit a non-digit, non-comma char
+    // Strip everything except digits and comma
     let num_str: String = cleaned
         .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(|c| c.is_ascii_digit() || *c == ',')
         .collect();
 
     let (whole_str, frac_str) = num_str.split_once(',')?;

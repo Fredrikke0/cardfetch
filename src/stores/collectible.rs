@@ -206,7 +206,11 @@ fn fetch_product_details(
 
 fn parse_price(raw: &str) -> Option<u32> {
     let raw = raw.trim();
-    let num_str = raw.split_whitespace().next()?.trim_end_matches(',');
+    // Strip everything except digits and the decimal comma.
+    let num_str: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == ',')
+        .collect();
     let (whole, frac) = num_str.split_once(',')?;
     let whole: u32 = whole.parse().ok()?;
     let frac: u32 = frac.parse().ok()?;

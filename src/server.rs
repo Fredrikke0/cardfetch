@@ -2,6 +2,7 @@ use crate::cache::{Cache, CacheLookup};
 use crate::stores::{self, Store, StoreResult, DELAY_JITTER_MS, DELAY_MS};
 use crate::wizard::{self, Strategy, WizardConfig, WizardSolution};
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,10 @@ pub struct FetchRequest {
     #[serde(default)]
     pub stores: Vec<String>,
     pub cards: Vec<String>,
+    /// If true, only return cached data — never creates a job, never 503.
+    /// The response may be incomplete (some stores not yet fetched).
+    #[serde(default)]
+    pub cache_only: bool,
 }
 
 #[derive(Deserialize)]
@@ -59,7 +64,7 @@ impl From<StoreResult> for CardResultEntry {
 #[serde(untagged)]
 pub enum JobResult {
     Fetch(HashMap<String, Vec<CardResultEntry>>),
-    Wizard(WizardResponseData),
+    Wizard(Vec<WizardResponseData>),
 }
 
 #[derive(Serialize, Clone)]
@@ -116,23 +121,46 @@ impl WizardResponseData {
             num_stores: sol.num_stores,
         }
     }
+
+    fn from_solutions(solutions: &[WizardSolution]) -> Vec<Self> {
+        solutions.iter().map(Self::from_solution).collect()
+    }
 }
 
 // ── Job system ───────────────────────────────────────────────────────────────
 
 /// Maximum number of concurrent pending+running jobs.
-const MAX_ACTIVE_JOBS: usize = 5;
+/// Set to 1 to respect per-store rate limiting.
+const MAX_ACTIVE_JOBS: usize = 1;
 
-/// A job tracks a long-running fetch or wizard operation.
+#[derive(Clone, Copy, PartialEq)]
+enum JobKind {
+    Fetch,
+    Wizard,
+}
+
 struct Job {
-    status: String, // "pending" | "running" | "done" | "failed"
+    kind: JobKind,
+    status: String,
     created_at: std::time::Instant,
+    /// Fetch: card×store pairs done (no longer used for progress; see `progress_done`).
     cards_done: usize,
+    /// Fetch: total card×store pairs.
     cards_total: usize,
+    /// Fetch: current store being queried (no longer used; see `progress_current`).
     current_store: String,
+    /// Fetch: current card being searched.
     current_card: String,
+    /// Fetch: live progress counter, updated by each store thread per card.
+    progress_done: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    /// Fetch: live (store_name, card_name), updated by each store thread.
+    progress_current: Option<Arc<Mutex<(String, String)>>>,
+    /// Wizard: tolerance level currently being optimized.
     tolerance_done: usize,
+    /// Wizard: total tolerance levels.
     tolerance_total: usize,
+    /// Wizard (exhaustive): total store subsets to evaluate.
+    combos_total: u64,
     result: Option<JobResult>,
     error: Option<String>,
 }
@@ -140,30 +168,53 @@ struct Job {
 #[derive(Serialize)]
 struct JobResponse {
     status: String,
+    kind: String,
     cards_done: usize,
     cards_total: usize,
     current_store: String,
     current_card: String,
     tolerance_done: usize,
     tolerance_total: usize,
-    /// Present only when done.
+    combos_done: u64,
+    combos_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<JobResult>,
-    /// Present only when failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 impl Job {
-    fn to_response(&self) -> JobResponse {
+    fn to_response(&self, combos_done: u64) -> JobResponse {
+        let kind = match self.kind {
+            JobKind::Fetch => "fetch",
+            JobKind::Wizard => "wizard",
+        };
+        let (cards_done, current_store, current_card) = if kind == "fetch" {
+            let done = self
+                .progress_done
+                .as_ref()
+                .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(self.cards_done);
+            let (store, card) = self
+                .progress_current
+                .as_ref()
+                .map(|a| a.lock().unwrap().clone())
+                .unwrap_or_else(|| (self.current_store.clone(), self.current_card.clone()));
+            (done, store, card)
+        } else {
+            (0, String::new(), String::new())
+        };
         JobResponse {
             status: self.status.clone(),
-            cards_done: self.cards_done,
+            kind: kind.into(),
+            cards_done,
             cards_total: self.cards_total,
-            current_store: self.current_store.clone(),
-            current_card: self.current_card.clone(),
+            current_store,
+            current_card,
             tolerance_done: self.tolerance_done,
             tolerance_total: self.tolerance_total,
+            combos_done,
+            combos_total: self.combos_total,
             result: self.result.clone(),
             error: self.error.clone(),
         }
@@ -198,9 +249,10 @@ impl AppState {
         }
     }
 
-    /// Try to reserve a job slot.  Cleans up completed/failed jobs older than
-    /// 30 minutes.  Returns Err if too many jobs are already active.
-    fn reserve_slot(&self) -> Result<(), String> {
+    /// Try to reserve a job slot for a given kind.
+    /// Cleans up completed/failed jobs older than 30 minutes.
+    /// Returns Err with 503 if too many jobs of the same kind are already active.
+    fn reserve_slot(&self, kind: JobKind) -> Result<(), (StatusCode, String)> {
         let mut jobs = self.jobs.lock().unwrap();
         let now = std::time::Instant::now();
         let ttl = Duration::from_secs(1800); // 30 minutes
@@ -214,15 +266,23 @@ impl AppState {
         let active = jobs
             .values()
             .filter(|j| {
-                let s = &j.lock().unwrap().status;
-                s == "pending" || s == "running"
+                let j = j.lock().unwrap();
+                (j.status == "pending" || j.status == "running") && j.kind == kind
             })
             .count();
 
+        let kind_name = match kind {
+            JobKind::Fetch => "fetch",
+            JobKind::Wizard => "wizard",
+        };
+
         if active >= MAX_ACTIVE_JOBS {
-            Err(format!(
-                "Server busy: {} job(s) already running. Try again in a moment.",
-                active
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "Server busy: {} {kind_name} job(s) already running. Try again in a moment.",
+                    active
+                ),
             ))
         } else {
             Ok(())
@@ -249,23 +309,88 @@ async fn get_stores(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(names)
 }
 
+/// Always returns cached results, skipping any entries that aren't cached.
+/// Used by `cache_only` mode — never returns None.
+fn serve_cache_partial(
+    cache: &Cache,
+    cards: &[String],
+    all_stores: &[Box<dyn Store>],
+    store_indices: &[usize],
+) -> std::collections::HashMap<String, Vec<CardResultEntry>> {
+    let mut grouped: std::collections::HashMap<String, Vec<CardResultEntry>> =
+        std::collections::HashMap::new();
+
+    for &si in store_indices {
+        let store = &all_stores[si];
+        for key in &store.cache_keys() {
+            for card_name in cards {
+                if let Ok(CacheLookup::Hit(results)) = cache.lookup(card_name, key) {
+                    for r in results {
+                        grouped.entry(card_name.clone()).or_default().push(r.into());
+                    }
+                }
+            }
+        }
+    }
+
+    grouped
+}
+
+/// Check whether every card×store pair is in the cache.  If so, return
+/// the grouped results.  If any entry is missing, return None.
+fn try_serve_from_cache(
+    cache: &Cache,
+    cards: &[String],
+    all_stores: &[Box<dyn Store>],
+    store_indices: &[usize],
+) -> Option<std::collections::HashMap<String, Vec<CardResultEntry>>> {
+    let mut grouped: std::collections::HashMap<String, Vec<CardResultEntry>> =
+        std::collections::HashMap::new();
+
+    for &si in store_indices {
+        let store = &all_stores[si];
+        for key in &store.cache_keys() {
+            for card_name in cards {
+                match cache.lookup(card_name, key).ok()? {
+                    CacheLookup::Hit(results) => {
+                        for r in results {
+                            grouped.entry(card_name.clone()).or_default().push(r.into());
+                        }
+                    }
+                    CacheLookup::Skip => {}
+                    _ => {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(grouped)
+}
+
 /// POST /fetch — create a background fetch job, return the job ID immediately.
+/// If all requested cards are already in cache, returns results directly
+/// (even while another job is running).
 async fn start_fetch(
     State(state): State<Arc<AppState>>,
     Json(req): Json<FetchRequest>,
-) -> Result<Json<serde_json::Value>, String> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut cards = req.cards;
     cards.sort();
     cards.dedup();
 
     if cards.is_empty() {
-        return Err("No cards provided.".into());
+        return Err((StatusCode::BAD_REQUEST, "No cards provided.".into()));
     }
     if cards.len() > 100 {
-        return Err(format!("Too many cards: {}. Max is 100.", cards.len()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Too many cards: {}. Max is 100.", cards.len()),
+        ));
     }
 
-    // Build the filtered store list early so we can report total work.
+    // Determine which store indices are active.
     let stores: Vec<usize> = state
         .stores
         .iter()
@@ -282,21 +407,47 @@ async fn start_fetch(
         .map(|(i, _)| i)
         .collect();
 
-    let cards_total = cards.len() * stores.len();
+    // cache_only: always return whatever is cached, never 503.
+    if req.cache_only {
+        let results = state
+            .cache
+            .as_ref()
+            .map(|c| serve_cache_partial(c, &cards, &state.stores, &stores))
+            .unwrap_or_default();
+        return Ok(Json(serde_json::json!({"results": results})));
+    }
 
-    state.reserve_slot()?;
+    // If we have a cache, check whether everything is already cached.
+    // If so, return results immediately — no job needed.
+    if let Some(ref cache) = state.cache {
+        if let Some(results) = try_serve_from_cache(cache, &cards, &state.stores, &stores) {
+            return Ok(Json(serde_json::json!({
+                "results": results
+            })));
+        }
+    }
+
+    let cards_total = cards.len() * stores.len();
+    let cards_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let current = Arc::new(Mutex::new((String::new(), String::new())));
+
+    state.reserve_slot(JobKind::Fetch)?;
 
     let job_id = new_job_id();
 
     let job = Arc::new(Mutex::new(Job {
+        kind: JobKind::Fetch,
         status: "pending".into(),
         created_at: std::time::Instant::now(),
         cards_done: 0,
         cards_total,
         current_store: String::new(),
         current_card: String::new(),
+        progress_done: Some(cards_done.clone()),
+        progress_current: Some(current.clone()),
         tolerance_done: 0,
         tolerance_total: 0,
+        combos_total: 0,
         result: None,
         error: None,
     }));
@@ -307,12 +458,14 @@ async fn start_fetch(
         .unwrap()
         .insert(job_id.clone(), job.clone());
 
-    // Spawn background work
+    // Spawn background work — one thread per store, results via mpsc.
     let job_ref = job.clone();
     let cache = state.cache.clone();
     let stores_arc = state.stores.clone();
     let stores_indices = stores;
     let cards_for_thread = cards.clone();
+    let cards_done = cards_done.clone();
+    let current = current.clone();
 
     std::thread::spawn(move || {
         {
@@ -320,17 +473,13 @@ async fn start_fetch(
             j.status = "running".into();
         }
 
-        let result = run_search_with_progress(
+        let result = run_search_parallel(
             &cards_for_thread,
-            &stores_arc,
+            stores_arc.clone(),
             &stores_indices,
-            cache.as_deref(),
-            |card_idx, store_idx, store_name, card_name| {
-                let mut j = job_ref.lock().unwrap();
-                j.cards_done = card_idx + store_idx * cards_for_thread.len();
-                j.current_store = store_name.into();
-                j.current_card = card_name.into();
-            },
+            cache.clone(),
+            cards_done,
+            current,
         );
 
         // Group results by card
@@ -352,61 +501,136 @@ async fn start_fetch(
 }
 
 /// POST /wizard — create a background wizard job, return the job ID immediately.
+/// If a suitable cached solution exists, returns results directly without creating a job.
 async fn start_wizard(
     State(state): State<Arc<AppState>>,
     Json(req): Json<WizardRequest>,
-) -> Result<Json<serde_json::Value>, String> {
-    let cache = state
-        .cache
-        .as_ref()
-        .ok_or_else(|| "Cache is not available (server started with --no-cache?)".to_string())?;
-
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let mut cards = req.cards;
     cards.sort();
     cards.dedup();
 
     if cards.is_empty() {
-        return Err("No cards provided.".into());
+        return Err((StatusCode::BAD_REQUEST, "No cards provided.".into()));
     }
     if cards.len() > 100 {
-        return Err(format!("Too many cards: {}. Max is 100.", cards.len()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Too many cards: {}. Max is 100.", cards.len()),
+        ));
+    }
+
+    if req.tolerance > 5 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("Tolerance too high: {}. Max is 5.", req.tolerance),
+        ));
     }
 
     let strategy = match req.strategy.as_str() {
         "simplest" => Strategy::Simplest,
         "cheapest" => Strategy::Cheapest,
         other => {
-            return Err(format!(
-                "Unknown strategy '{}'. Use 'cheapest' or 'simplest'.",
-                other
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown strategy '{}'. Use 'cheapest' or 'simplest'.",
+                    other
+                ),
             ))
         }
     };
 
     // Quick check: do we have cache entries?
-    let listings = cache
-        .get_listings(&cards)
-        .map_err(|e| format!("Failed to read cache: {}", e))?;
+    let cache = state.cache.as_ref().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Cache is not available (server started with --no-cache?).".into(),
+        )
+    })?;
+
+    let listings = cache.get_listings(&cards).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read cache: {}", e),
+        )
+    })?;
 
     if listings.is_empty() {
-        return Err("No cached listings found. Run a /fetch first.".into());
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No cached listings found. Run a /fetch first.".into(),
+        ));
+    }
+
+    let strategy_name = match strategy {
+        Strategy::Simplest => "simplest",
+        Strategy::Cheapest => "cheapest",
+    };
+
+    // Check if we have suitable cached solutions for the exact parameters.
+    // Only skip computation if the cache is exhaustive, or if the current
+    // request is also non-exhaustive (heuristic).
+    let cached = cache
+        .get_cached_solutions(strategy_name, req.tolerance, req.eu_destination)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Cache error: {}", e),
+            )
+        })?;
+
+    if !cached.is_empty() {
+        let can_use_cache =
+            cached.iter().any(|(_, was_exhaustive)| *was_exhaustive) || !req.exhaustive;
+        if can_use_cache {
+            let input =
+                wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
+            let config = WizardConfig {
+                strategy,
+                tolerance: req.tolerance,
+            };
+            let solutions: Vec<_> = cached
+                .iter()
+                .map(|(history, _)| {
+                    wizard::solution_from_choices(&history.raw_choices, &input, &config)
+                })
+                .collect();
+            return Ok(Json(serde_json::json!({
+                "results": WizardResponseData::from_solutions(&solutions)
+            })));
+        }
+        // Cache was non-exhaustive but request is exhaustive — fall through to compute.
     }
 
     let tolerance_total = req.tolerance + 1;
 
-    state.reserve_slot()?;
+    // Pre-compute exhaustive combo count if needed.
+    let input = wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
+    let combos_total = if req.exhaustive {
+        let candidates = wizard::select_candidate_stores(&input);
+        wizard::exhaustive_combo_total(&candidates)
+    } else {
+        0
+    };
+
+    state.reserve_slot(JobKind::Wizard)?;
 
     let job_id = new_job_id();
 
     let job = Arc::new(Mutex::new(Job {
+        kind: JobKind::Wizard,
         status: "pending".into(),
         created_at: std::time::Instant::now(),
-        cards_done: cards.len(),
-        cards_total: cards.len(),
+        cards_done: 0,
+        cards_total: 0,
         current_store: String::new(),
         current_card: String::new(),
+        progress_done: None,
+        progress_current: None,
         tolerance_done: 0,
         tolerance_total,
+        combos_total,
         result: None,
         error: None,
     }));
@@ -419,9 +643,9 @@ async fn start_wizard(
 
     let job_ref = job.clone();
     let cache_clone = cache.clone();
-    let cards_for_thread = cards.clone();
-    let eu = req.eu_destination;
     let exhaustive = req.exhaustive;
+    let tolerance = req.tolerance;
+    let eu = req.eu_destination;
 
     std::thread::spawn(move || {
         {
@@ -429,11 +653,11 @@ async fn start_wizard(
             j.status = "running".into();
         }
 
-        // Build input
-        let input = wizard::WizardInput::from_results_and_wants(listings, &cards_for_thread, eu);
-
         let exhaustive_candidates = if exhaustive {
-            Some(wizard::select_candidate_stores(&input))
+            let c = wizard::select_candidate_stores(&input);
+            // Reset the global combo counter before the exhaustive run.
+            crate::wizard::EXHAUSTIVE_COMBO_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+            Some(c)
         } else {
             None
         };
@@ -441,8 +665,11 @@ async fn start_wizard(
         let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
         let mut solutions: Vec<(usize, WizardSolution)> = Vec::new();
 
-        for t in 0..=req.tolerance {
+        for t in 0..=tolerance {
             if let Some(ref candidates) = exhaustive_candidates {
+                // Reset counter at the start of each tolerance level.
+                crate::wizard::EXHAUSTIVE_COMBO_COUNT
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 search_mode = wizard::SearchMode::Exhaustive {
                     candidates: candidates.clone(),
                 };
@@ -451,13 +678,17 @@ async fn start_wizard(
                 strategy,
                 tolerance: t,
             };
-            if let Some(sol) = wizard::optimize_input(&input, &config, &search_mode) {
+            let results = wizard::optimize_input(&input, &config, &search_mode);
+            if !results.is_empty() {
+                let best = &results[0];
                 if exhaustive_candidates.is_none() {
                     search_mode = wizard::SearchMode::Heuristic {
-                        seed: Some(sol.raw_choices.clone()),
+                        seed: Some(best.raw_choices.clone()),
                     };
                 }
-                solutions.push((t, sol));
+                for sol in results {
+                    solutions.push((t, sol));
+                }
             }
 
             {
@@ -474,17 +705,26 @@ async fn start_wizard(
             return;
         }
 
-        let best = solutions.last().unwrap();
-        let strategy_name = match strategy {
-            Strategy::Simplest => "simplest",
-            Strategy::Cheapest => "cheapest",
-        };
-        let _ = cache_clone.save_wizard_solution(strategy_name, best.0, eu, &best.1);
+        // Save all solutions to cache with rank.
+        let mut tol_counter: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (t, sol) in &solutions {
+            let rank = tol_counter.entry(*t).or_insert(0);
+            *rank += 1;
+            let _ = cache_clone.save_wizard_solution(strategy_name, *t, eu, exhaustive, *rank, sol);
+        }
+
+        // Return all solutions for the max tolerance, best first.
+        let max_tol_solutions: Vec<WizardSolution> = solutions
+            .iter()
+            .filter(|(t, _)| *t == tolerance)
+            .map(|(_, s)| s.clone())
+            .collect();
 
         j.status = "done".into();
         j.tolerance_done = tolerance_total;
-        j.result = Some(JobResult::Wizard(WizardResponseData::from_solution(
-            &best.1,
+        j.result = Some(JobResult::Wizard(WizardResponseData::from_solutions(
+            &max_tol_solutions,
         )));
     });
 
@@ -495,118 +735,160 @@ async fn start_wizard(
 async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Result<Json<JobResponse>, String> {
+) -> Result<Json<JobResponse>, (StatusCode, String)> {
+    let combos_done =
+        crate::wizard::EXHAUSTIVE_COMBO_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let jobs = state.jobs.lock().unwrap();
     let job = jobs
         .get(&id)
-        .ok_or_else(|| format!("Job '{}' not found.", id))?;
-    let response = job.lock().unwrap().to_response();
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Job '{}' not found.", id)))?;
+    let response = job.lock().unwrap().to_response(combos_done);
     Ok(Json(response))
 }
 
-// ── Core search logic (with progress callback) ───────────────────────────────
+// ── Core search logic (parallel per store, like the CLI) ───────────────────
 
-/// Run the search sequentially across stores.  The progress callback is called
-/// after each card, passing (card_index, store_index, store_name, card_name).
-fn run_search_with_progress(
+/// Run the search across stores in parallel (one thread per store, same as
+/// the CLI).  Increments `cards_done` (atomic) after each card.  Updates
+/// `current` (store_name, card_name) under a mutex for the progress display.
+fn run_search_parallel(
     cards: &[String],
-    all_stores: &[Box<dyn Store>],
+    all_stores: Arc<Vec<Box<dyn Store>>>,
     store_indices: &[usize],
-    cache: Option<&Cache>,
-    mut on_progress: impl FnMut(usize, usize, &str, &str),
+    cache: Option<Arc<Cache>>,
+    cards_done: Arc<std::sync::atomic::AtomicUsize>,
+    current: Arc<Mutex<(String, String)>>,
 ) -> Vec<StoreResult> {
-    let mut all_results = Vec::new();
+    let cards_arc = Arc::new(cards.to_vec());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut handles = Vec::new();
 
-    for (si, &store_idx) in store_indices.iter().enumerate() {
-        let store = &all_stores[store_idx];
-        let store_name = store.name().to_string();
-        let timeout = Duration::from_secs(store.timeout_secs());
+    for &si in store_indices {
+        let tx = tx.clone();
+        let cards = cards_arc.clone();
+        let stores = all_stores.clone();
+        let cache = cache.clone();
+        let cards_done = cards_done.clone();
+        let current = current.clone();
 
-        let client = {
-            let mut builder = reqwest::blocking::Client::builder()
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                .timeout(timeout);
-            if store_name.starts_with("cardmarket") {
-                builder = builder.cookie_store(true);
-            }
-            builder
-                .build()
-                .expect("Failed to build per-store HTTP client")
-        };
+        let handle = std::thread::spawn(move || {
+            let store = &stores[si];
+            let store_name = store.name().to_string();
+            let timeout = Duration::from_secs(store.timeout_secs());
 
-        for (ci, card_name) in cards.iter().enumerate() {
-            on_progress(ci, si, &store_name, card_name);
-
-            let cache_keys = store.cache_keys();
-            let mut results_for_card: Vec<StoreResult> = Vec::new();
-            let mut keys_to_fetch: Vec<String> = Vec::new();
-
-            // Check cache
-            for key in &cache_keys {
-                let lookup = cache.map(|c| c.lookup(card_name, key)).transpose();
-                match lookup {
-                    Ok(Some(CacheLookup::Hit(hit_results))) => {
-                        results_for_card.extend(hit_results);
-                    }
-                    Ok(Some(CacheLookup::Skip)) => {}
-                    _ => {
-                        keys_to_fetch.push(key.clone());
-                    }
+            let client = {
+                let mut builder = reqwest::blocking::Client::builder()
+                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                    .timeout(timeout);
+                if store_name.starts_with("cardmarket") {
+                    builder = builder.cookie_store(true);
                 }
-            }
+                builder
+                    .build()
+                    .expect("Failed to build per-store HTTP client")
+            };
 
-            // Fetch uncached
-            if !keys_to_fetch.is_empty() {
-                std::thread::sleep(Duration::from_millis(
-                    DELAY_MS + rand::random::<u64>() % DELAY_JITTER_MS,
-                ));
+            for card_name in cards.iter() {
+                {
+                    let mut cur = current.lock().unwrap();
+                    cur.0 = store_name.clone();
+                    cur.1 = card_name.clone();
+                }
 
-                for key in &keys_to_fetch {
-                    match store.search_sub(&client, card_name, key) {
-                        Ok(sub_results) => {
-                            if sub_results.is_empty() {
-                                let gave_up = key.starts_with("cardmarket")
-                                    && stores::cardmarket::is_blocked();
-                                if !gave_up {
-                                    if let Some(c) = cache {
-                                        let _ = c.store(card_name, key, None);
-                                    }
-                                }
-                            } else {
-                                if let Some(c) = cache {
-                                    let mut by_store: HashMap<String, Vec<StoreResult>> =
-                                        HashMap::new();
-                                    for result in &sub_results {
-                                        by_store
-                                            .entry(result.store_name.clone())
-                                            .or_default()
-                                            .push(result.clone());
-                                    }
-                                    for (sn, grouped) in &by_store {
-                                        let _ = c.store(card_name, sn, Some(grouped.as_slice()));
-                                    }
-                                }
-                                for result in sub_results {
-                                    results_for_card.push(result);
-                                }
-                            }
+                let cache_keys = store.cache_keys();
+                let mut results_for_card: Vec<StoreResult> = Vec::new();
+                let mut keys_to_fetch: Vec<String> = Vec::new();
+
+                for key in &cache_keys {
+                    let lookup = cache.as_ref().map(|c| c.lookup(card_name, key)).transpose();
+                    match lookup {
+                        Ok(Some(CacheLookup::Hit(hit_results))) => {
+                            results_for_card.extend(hit_results);
                         }
-                        Err(e) => {
-                            if e.downcast_ref::<stores::cardmarket::RescuePending>()
-                                .is_some()
-                            {
-                                eprintln!("  [{}] CardMarket blocked for '{}'", key, card_name);
-                            } else {
-                                eprintln!("  [{}] Failed: '{}': {}", key, card_name, e);
-                            }
+                        Ok(Some(CacheLookup::Skip)) => {}
+                        _ => {
+                            keys_to_fetch.push(key.clone());
                         }
                     }
                 }
-            }
 
-            all_results.extend(results_for_card);
-        }
+                if !keys_to_fetch.is_empty() {
+                    std::thread::sleep(Duration::from_millis(
+                        DELAY_MS + rand::random::<u64>() % DELAY_JITTER_MS,
+                    ));
+
+                    for key in &keys_to_fetch {
+                        match store.search_sub(&client, card_name, key) {
+                            Ok(sub_results) => {
+                                if sub_results.is_empty() {
+                                    let gave_up = key.starts_with("cardmarket")
+                                        && stores::cardmarket::is_blocked();
+                                    if !gave_up {
+                                        if let Some(ref c) = cache {
+                                            let _ = c.store(card_name, key, None);
+                                        }
+                                    }
+                                } else {
+                                    if let Some(ref c) = cache {
+                                        let mut by_store: HashMap<String, Vec<StoreResult>> =
+                                            HashMap::new();
+                                        for result in &sub_results {
+                                            by_store
+                                                .entry(result.store_name.clone())
+                                                .or_default()
+                                                .push(result.clone());
+                                        }
+                                        for (sn, grouped) in &by_store {
+                                            let _ =
+                                                c.store(card_name, sn, Some(grouped.as_slice()));
+                                        }
+                                    }
+                                    for result in sub_results {
+                                        results_for_card.push(result);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if e.downcast_ref::<stores::cardmarket::RescuePending>()
+                                    .is_some()
+                                {
+                                    eprintln!("  [{}] CardMarket blocked for '{}'", key, card_name);
+                                } else {
+                                    let msg = e.to_string();
+                                    if msg.contains("connection is closed")
+                                        || msg.contains("connection closed")
+                                    {
+                                        eprintln!(
+                                            "  [{}] CardMarket browser died — restart server. '{}'",
+                                            key, card_name
+                                        );
+                                    } else {
+                                        eprintln!("  [{}] Failed: '{}': {}", key, card_name, msg);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for result in results_for_card {
+                    if tx.send(result).is_err() {
+                        break;
+                    }
+                }
+
+                cards_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+
+        handles.push(handle);
     }
 
-    all_results
+    // Wait for all store threads to finish.
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    drop(tx);
+    rx.into_iter().collect()
 }
