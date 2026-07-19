@@ -776,17 +776,11 @@ fn run_search_parallel(
             let store_name = store.name().to_string();
             let timeout = Duration::from_secs(store.timeout_secs());
 
-            let client = {
-                let mut builder = reqwest::blocking::Client::builder()
-                    .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-                    .timeout(timeout);
-                if store_name.starts_with("cardmarket") {
-                    builder = builder.cookie_store(true);
-                }
-                builder
-                    .build()
-                    .expect("Failed to build per-store HTTP client")
-            };
+            let client = reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+                .timeout(timeout)
+                .build()
+                .expect("Failed to build per-store HTTP client");
 
             for card_name in cards.iter() {
                 {

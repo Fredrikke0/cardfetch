@@ -610,6 +610,29 @@ fn store_prefix_from_flags(is_international: bool, is_private: bool) -> &'static
     }
 }
 
+/// Convert a CardMarket user‑profile URL into a filtered Singles offer URL
+/// that scopes results to a particular card name.
+///
+/// Input:  `https://www.cardmarket.com/en/Magic/Users/91since`
+/// Output: `https://www.cardmarket.com/en/Magic/Users/91since/Offers/Singles?name=Ambitious%20augmenter&sortBy=name_asc`
+fn make_cardmarket_offer_url(seller_url: &str, card_name: &str) -> String {
+    let encoded = percent_encode_card_name(card_name);
+    format!("{seller_url}/Offers/Singles?name={encoded}&sortBy=name_asc")
+}
+
+/// Percent-encode a card name for use in a CardMarket query parameter.
+fn percent_encode_card_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~' {
+                c.to_string()
+            } else {
+                format!("%{:02X}", c as u8)
+            }
+        })
+        .collect()
+}
+
 /// Convert seller entries to StoreResults with price conversion, VAT, and
 /// store-prefix formatting.
 fn sellers_to_results(
@@ -631,7 +654,7 @@ fn sellers_to_results(
                 store_name: format!("{}: {}", store_prefix, e.name),
                 card_name: card_name.to_string(),
                 price: price_oere,
-                url: e.url,
+                url: make_cardmarket_offer_url(&e.url, card_name),
             }
         })
         .collect()
