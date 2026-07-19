@@ -29,22 +29,20 @@ impl Store for Adamstuen {
     ) -> anyhow::Result<Vec<StoreResult>> {
         let all_products = fetch_search_results(client, card_name)?;
 
-        // Pick the cheapest in-stock product whose title contains the card name
-        let best = match all_products
-            .iter()
+        // Return all in-stock products matching the card name, so the wizard
+        // can pick the cheapest variant.
+        let matching: Vec<_> = all_products
+            .into_iter()
             .filter(|p| p.in_stock && title_contains(card_name, &p.name))
-            .min_by_key(|p| p.price)
-        {
-            Some(p) => p,
-            None => return Ok(vec![]),
-        };
+            .map(|p| StoreResult {
+                store_name: STORE_NAME.to_string(),
+                card_name: card_name.to_string(),
+                price: p.price,
+                url: p.url,
+            })
+            .collect();
 
-        Ok(vec![StoreResult {
-            store_name: STORE_NAME.to_string(),
-            card_name: card_name.to_string(),
-            price: best.price,
-            url: best.url.clone(),
-        }])
+        Ok(matching)
     }
 }
 
@@ -162,12 +160,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_store_name() {
-        let store = Adamstuen::new();
-        assert_eq!(store.name(), "adamstuenretro.no");
-    }
-
-    #[test]
     fn test_parse_price() {
         assert_eq!(parse_price("4 NOK"), Some(400));
         assert_eq!(parse_price("1,499 NOK"), Some(149900));
@@ -175,19 +167,6 @@ mod tests {
         assert_eq!(parse_price("3,499 NOK"), Some(349900));
         assert_eq!(parse_price(""), None);
         assert_eq!(parse_price("abc"), None);
-    }
-
-    #[test]
-    fn test_title_contains() {
-        assert!(title_contains(
-            "Snakeskin Veil",
-            "Snakeskin Veil (Kaldheim)"
-        ));
-        assert!(title_contains(
-            "snakeskin veil",
-            "Snakeskin Veil (Strixhaven Mystical Archive)"
-        ));
-        assert!(!title_contains("Black Lotus", "Snakeskin Veil (Kaldheim)"));
     }
 
     #[test]

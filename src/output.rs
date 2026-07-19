@@ -1,4 +1,4 @@
-use crate::cache::WizardHistory;
+use crate::shipping;
 use crate::stores::StoreResult;
 use crate::wizard::WizardSolution;
 use std::collections::{BTreeMap, HashMap};
@@ -30,17 +30,18 @@ fn abbreviate(name: &str) -> String {
 }
 
 /// Format a price stored as integer oere to e.g. "15,00 kr".
-fn format_price(oere: u32) -> String {
+fn format_price(oere: u64) -> String {
     let whole = oere / 100;
     let frac = oere % 100;
     format!("{},{:02} kr", whole, frac)
 }
 
-/// Like `format_price` but for u64.
-fn format_price_u64(oere: u64) -> String {
-    let whole = oere / 100;
-    let frac = oere % 100;
-    format!("{},{:02} kr", whole, frac)
+fn strategy_label(strategy: &str) -> &str {
+    match strategy {
+        "simplest" => "Simplest",
+        "cheapest" => "Cheapest",
+        other => other,
+    }
 }
 
 /// Wrap `text` in an OSC 8 hyperlink.  In modern terminals the text renders
@@ -183,7 +184,7 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
         .map(|(i, name)| {
             let max_cell = rows
                 .iter()
-                .filter_map(|r| r.cells[i].0.map(|sr| format_price(sr.price).len()))
+                .filter_map(|r| r.cells[i].0.map(|sr| format_price(sr.price as u64).len()))
                 .max()
                 .unwrap_or(1);
             abbreviate(name).len().max(max_cell).max(1)
@@ -212,7 +213,7 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
             print!(" | ");
             match opt {
                 Some(sr) => {
-                    let price_str = format_price(sr.price);
+                    let price_str = format_price(sr.price as u64);
                     let raw = if *is_cheap {
                         format!("\x1b[32m{}\x1b[0m", price_str)
                     } else {
@@ -244,7 +245,7 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
     for (i, total) in totals.iter().enumerate() {
         print!(" | ");
         if *total > 0 {
-            let s = format_price_u64(*total);
+            let s = format_price(*total);
             print_cell(&s, &s, store_widths[i]);
         } else {
             print_cell("-", "-", store_widths[i]);
@@ -362,14 +363,14 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
                 if entries.len() == 1 { "" } else { "s" }
             );
             for (card_name, price, url) in entries {
-                let ps = format_price(*price);
+                let ps = format_price(*price as u64);
                 let linked = hyperlink(url, &ps);
                 let pad = max_name.saturating_sub(card_name.len());
                 println!("    {card_name}{:pad$}  {linked}", "");
             }
             let sep = "-".repeat(max_name + 16);
             println!("    {sep}");
-            println!("    Subtotal: {}", format_price_u64(subtotal));
+            println!("    Subtotal: {}", format_price(subtotal));
         }
 
         let hidden_count = total.saturating_sub(visible.len());
@@ -388,7 +389,7 @@ fn print_cardmarket_section(cards: &[String], cm_grouped: &HashMap<&str, Vec<&St
                 "  ... and {hidden_count} more seller{} ({} cards, {} total)",
                 if hidden_count == 1 { "" } else { "s" },
                 others_cards,
-                format_price_u64(others_total),
+                format_price(others_total),
             );
         }
     }
@@ -405,14 +406,8 @@ pub fn print_wizard_summary(
     solutions: &[(usize, WizardSolution)],
     strategy: &str,
     wanted_cards: &[String],
-    prev_history: &HashMap<usize, WizardHistory>,
+    eu_destination: bool,
 ) {
-    let strategy_label = match strategy {
-        "simplest" => "Simplest",
-        "cheapest" => "Cheapest",
-        other => other,
-    };
-
     let total_cards = wanted_cards.len();
 
     let hline = "\u{2550}";
@@ -420,31 +415,34 @@ pub fn print_wizard_summary(
 
     println!();
     println!("{banner}");
-    println!("  Purchase Wizard \u{2014} {strategy_label} Strategy");
-    println!("  {total_cards} wanted cards, {} cached sellers", {
-        let count: usize = solutions
-            .first()
-            .map(|(_, s)| s.store_names.len())
-            .unwrap_or(0);
-        count
-    });
+    println!(
+        "  Purchase Wizard \u{2014} {} Strategy",
+        strategy_label(strategy)
+    );
+    println!(
+        "  {total_cards} wanted cards, {} cached sellers{}",
+        {
+            let count: usize = solutions
+                .first()
+                .map(|(_, s)| s.store_names.len())
+                .unwrap_or(0);
+            count
+        },
+        if eu_destination {
+            "  (EU destination)"
+        } else {
+            ""
+        }
+    );
     println!("{banner}");
     println!();
 
     // ── Summary table ──────────────────────────────────────────────────
     println!(
-        "  {:>9}  {:>6}  {:>5}  {:>6}  {:>9}  {:>8}  {:>14}  {:>9}  {:>14}",
-        "Tolerance",
-        "Stores",
-        "Found",
-        "Skipped",
-        "Cards",
-        "Shipping",
-        "Total",
-        "Per card",
-        "vs prev"
+        "  {:>9}  {:>6}  {:>5}  {:>9}  {:>8}  {:>14}  {:>9}  {:>10}",
+        "Tolerance", "Stores", "Found", "Cards", "Shipping", "Total", "Per card", "EU price",
     );
-    let sep = "\u{2500}".repeat(101);
+    let sep = "\u{2500}".repeat(84);
     println!("  {sep}");
 
     for (t, sol) in solutions {
@@ -452,27 +450,23 @@ pub fn print_wizard_summary(
         let grand = sol.total_card_cost + sol.total_shipping;
         let avg = if found > 0 { grand / found as u64 } else { 0 };
 
-        let total_str = format_price_u64(grand);
-        let delta_str = match prev_history.get(t) {
-            Some(prev) if grand < prev.total_cost => {
-                let saved = prev.total_cost.saturating_sub(grand);
-                format!("-{}", format_price_u64(saved))
-            }
-            Some(_) => "\u{2014}".to_string(),
-            None => "\u{2014} (new!)".to_string(),
+        let eu_str = if eu_destination {
+            "\u{2014}".to_string()
+        } else {
+            let eu_total = compute_eu_cost(sol);
+            format_price(eu_total)
         };
 
         println!(
-            "  {:>9}  {:>6}  {:>5}  {:>6}  {:>9}  {:>8}  {:>14}  {:>9}  {:>14}",
+            "  {:>9}  {:>6}  {:>5}  {:>9}  {:>8}  {:>14}  {:>9}  {:>10}",
             t,
             sol.num_stores,
             format!("{}/{}", found, total_cards),
-            sol.skipped.len(),
-            format_price_u64(sol.total_card_cost),
-            format_price_u64(sol.total_shipping),
-            total_str,
-            format_price_u64(avg),
-            delta_str,
+            format_price(sol.total_card_cost),
+            format_price(sol.total_shipping),
+            format_price(grand),
+            format_price(avg),
+            eu_str,
         );
     }
     println!();
@@ -482,20 +476,53 @@ pub fn print_wizard_summary(
     print_wizard_table(max_sol, strategy, *max_t);
 }
 
+/// Compute what the total cost would be with EU destination pricing.
+/// Strips 25% VAT from international CardMarket card prices and shipping,
+/// and removes the customs fee from private international sellers.
+fn compute_eu_cost(sol: &WizardSolution) -> u64 {
+    let mut card_total: u64 = 0;
+    for (_, assignment) in &sol.assignments {
+        if let Some((store_name, price, _)) = assignment {
+            if store_name.starts_with("cardmarket-int.com:")
+                || store_name.starts_with("cardmarket-int-private.com:")
+            {
+                card_total += (*price as f64 / shipping::VAT_MULTIPLIER).round() as u64;
+            } else {
+                card_total += *price as u64;
+            }
+        }
+    }
+
+    let mut shipping_total: u64 = 0;
+    for (si, store_name) in sol.store_names.iter().enumerate() {
+        let s = sol.shipping_costs[si] as u64;
+        if s == 0 {
+            continue;
+        }
+        if store_name.starts_with("cardmarket-int-private.com:") {
+            let base = s.saturating_sub(shipping::CUSTOMS_FEE);
+            shipping_total += (base as f64 / shipping::VAT_MULTIPLIER).round() as u64;
+        } else if store_name.starts_with("cardmarket-int.com:") {
+            shipping_total += (s as f64 / shipping::VAT_MULTIPLIER).round() as u64;
+        } else {
+            shipping_total += s;
+        }
+    }
+
+    card_total + shipping_total
+}
+
 /// Print purchase wizard result in a per-store format.
 pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize) {
-    let strategy_label = match strategy {
-        "simplest" => "Simplest",
-        "cheapest" => "Cheapest",
-        other => other,
-    };
-
     let hline = "\u{2550}";
     let banner = hline.repeat(50);
 
     println!();
     println!("{banner}");
-    println!("  Purchase Wizard \u{2014} {strategy_label} Strategy (tolerance: {tolerance})");
+    println!(
+        "  Purchase Wizard \u{2014} {} Strategy (tolerance: {tolerance})",
+        strategy_label(strategy)
+    );
     println!("{banner}");
 
     let total_cards = sol.assignments.len();
@@ -510,7 +537,7 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
         if sol.num_stores == 1 { "" } else { "s" },
         found,
         total_cards,
-        format_price_u64(grand),
+        format_price(grand),
     );
     println!("{sep}");
 
@@ -572,7 +599,7 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
         );
 
         for (card_name, price, url) in cards {
-            let ps = format_price(*price);
+            let ps = format_price(*price as u64);
             let linked = hyperlink(url, &ps);
             let pad = max_name.saturating_sub(card_name.len());
             println!("    {card_name}{:pad$}  {linked}", "");
@@ -581,9 +608,9 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
         println!("    {store_sep}");
         println!(
             "    Card subtotal: {}  |  Shipping: {}  |  Store total: {}",
-            format_price_u64(card_total),
-            format_price_u64(shipping),
-            format_price_u64(st),
+            format_price(card_total),
+            format_price(shipping),
+            format_price(st),
         );
     }
 
@@ -593,9 +620,9 @@ pub fn print_wizard_table(sol: &WizardSolution, strategy: &str, tolerance: usize
     println!("{grand_sep}");
     println!(
         "  GRAND TOTAL: {}  |  Card total: {}  |  Shipping: {}",
-        format_price_u64(grand),
-        format_price_u64(sol.total_card_cost),
-        format_price_u64(sol.total_shipping),
+        format_price(grand),
+        format_price(sol.total_card_cost),
+        format_price(sol.total_shipping),
     );
 
     if !sol.skipped.is_empty() {

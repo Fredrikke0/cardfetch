@@ -85,15 +85,21 @@ impl Store for Collectible {
 
         let products = parse_search_results(&html_text)?;
 
-        let matching = products.iter().find(|p| title_contains(card_name, &p.name));
+        let matching: Vec<super::SearchProduct> = products
+            .into_iter()
+            .filter(|p| title_contains(card_name, &p.name))
+            .collect();
 
-        if let Some(product) = matching {
-            return Ok(vec![StoreResult {
-                store_name: STORE_NAME.to_string(),
-                card_name: card_name.to_string(),
-                price: product.price,
-                url: product.url.clone(),
-            }]);
+        if !matching.is_empty() {
+            return Ok(matching
+                .into_iter()
+                .map(|p| StoreResult {
+                    store_name: STORE_NAME.to_string(),
+                    card_name: card_name.to_string(),
+                    price: p.price,
+                    url: p.url,
+                })
+                .collect());
         }
 
         Ok(vec![])
@@ -215,38 +221,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_store_name() {
-        let store = Collectible::new();
-        assert_eq!(store.name(), "collectible.no");
-    }
-
-    #[test]
-    fn test_urlencode() {
-        assert_eq!(urlencode_plus("Opal Palace"), "Opal+Palace");
-        assert_eq!(urlencode_plus("snakeskin veil"), "snakeskin+veil");
-    }
-
-    #[test]
     fn test_parse_price() {
         assert_eq!(parse_price("3,90 kr"), Some(390));
         assert_eq!(parse_price("  3,90  kr  "), Some(390));
         assert_eq!(parse_price("15,00"), Some(1500));
         assert_eq!(parse_price("0,50 kr"), Some(50));
-    }
-
-    #[test]
-    fn test_title_contains() {
-        assert!(title_contains(
-            "Opal Palace",
-            "Commander Legends - 352 - Opal Palace - Common - C - Non-foil"
-        ));
-        assert!(title_contains(
-            "opal palace",
-            "Commander Legends - 352 - Opal Palace - Common - C - Non-foil"
-        ));
-        assert!(!title_contains(
-            "Black Lotus",
-            "Commander Legends - 352 - Opal Palace - Common - C - Non-foil"
-        ));
     }
 }

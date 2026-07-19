@@ -1,3 +1,4 @@
 /target
-cache.db
-cache*
+*.db
+*.db-shm
+*.db-wal

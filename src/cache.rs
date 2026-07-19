@@ -1,4 +1,6 @@
+use crate::shipping;
 use crate::stores::StoreResult;
+use crate::wizard::WizardSolution;
 use anyhow::Context;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -21,19 +23,12 @@ pub enum CacheLookup {
 
 /// A single wizard solution record loaded from the database.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WizardHistory {
     pub tolerance: usize,
     pub num_stores: usize,
-    pub num_found: usize,
     pub num_skipped: usize,
-    pub total_card_cost: u64,
-    pub total_shipping: u64,
     pub total_cost: u64,
-    pub per_card_cost: u64,
     pub raw_choices: Vec<Option<usize>>,
-    pub created_at: i64,
-    pub is_current: bool,
 }
 
 /// Thread-safe SQLite cache for store search results.
@@ -81,6 +76,7 @@ impl Cache {
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 strategy        TEXT NOT NULL,
                 tolerance       INTEGER NOT NULL,
+                eu_destination  INTEGER NOT NULL DEFAULT 0,
                 num_stores      INTEGER NOT NULL,
                 num_found       INTEGER NOT NULL,
                 num_skipped     INTEGER NOT NULL,
@@ -91,7 +87,7 @@ impl Cache {
                 assignments_json TEXT NOT NULL DEFAULT '[]',
                 created_at      INTEGER NOT NULL,
                 is_current      INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(strategy, tolerance)
+                UNIQUE(strategy, tolerance, eu_destination)
             );
             CREATE INDEX IF NOT EXISTS idx_wizard_solutions_strat
                 ON wizard_solutions(strategy, tolerance);",
@@ -108,6 +104,20 @@ impl Cache {
                     "ALTER TABLE wizard_solutions ADD COLUMN assignments_json TEXT NOT NULL DEFAULT '[]';",
                 )
                 .context("Failed to migrate wizard_solutions schema")?;
+            }
+        }
+
+        // Migration: add eu_destination column if upgrading from older schema.
+        {
+            let has_col: bool = conn
+                .prepare("SELECT eu_destination FROM wizard_solutions LIMIT 0")
+                .is_ok();
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE wizard_solutions ADD COLUMN eu_destination INTEGER NOT NULL DEFAULT 0;",
+                )
+                .context("Failed to migrate wizard_solutions schema")?;
+                // Existing solutions were computed without --eu-destination, so 0 is correct.
             }
         }
 
@@ -140,11 +150,10 @@ impl Cache {
                AND (store_name = ?2 OR store_name LIKE (?2 || ':%'))",
         )?;
 
-        let row: Option<(Option<i64>, i64)> = stmt
-            .query_row(rusqlite::params![card_name, store_name], |row| {
-                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
-            })
-            .optional()?;
+        let row = stmt.query_row(rusqlite::params![card_name, store_name], |row| {
+            Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
+        });
+        let row = optional(row)?;
 
         match row {
             Some((Some(fetched_at), in_stock_count)) => {
@@ -283,43 +292,40 @@ impl Cache {
     // ── Wizard solution history ───────────────────────────────────────────
 
     /// Save a wizard solution.  Uses INSERT OR REPLACE so only the best
-    /// solution per (strategy, tolerance) survives.
-    /// `raw_choices` is the full assignment — serialized as JSON.
+    /// solution per (strategy, tolerance, eu_destination) survives.
     pub fn save_wizard_solution(
         &self,
         strategy: &str,
         tolerance: usize,
-        num_stores: usize,
-        num_found: usize,
-        num_skipped: usize,
-        total_card_cost: u64,
-        total_shipping: u64,
-        total_cost: u64,
-        raw_choices: &[Option<usize>],
+        eu_destination: bool,
+        solution: &WizardSolution,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = epoch_secs();
+        let num_found = solution.assignments.len() - solution.skipped.len();
+        let total_cost = solution.total_card_cost + solution.total_shipping;
         let per_card = if num_found > 0 {
             total_cost / num_found as u64
         } else {
             0
         };
-        let assignments_json = serde_json::to_string(raw_choices)?;
+        let assignments_json = serde_json::to_string(&solution.raw_choices)?;
 
         conn.execute(
             "INSERT OR REPLACE INTO wizard_solutions
-                (strategy, tolerance, num_stores, num_found, num_skipped,
+                (strategy, tolerance, eu_destination, num_stores, num_found, num_skipped,
                  total_card_cost, total_shipping, total_cost, per_card_cost,
                  assignments_json, created_at, is_current)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
             rusqlite::params![
                 strategy,
                 tolerance as i64,
-                num_stores as i64,
+                eu_destination as i64,
+                solution.num_stores as i64,
                 num_found as i64,
-                num_skipped as i64,
-                total_card_cost as i64,
-                total_shipping as i64,
+                solution.skipped.len() as i64,
+                solution.total_card_cost as i64,
+                solution.total_shipping as i64,
                 total_cost as i64,
                 per_card as i64,
                 assignments_json,
@@ -331,11 +337,15 @@ impl Cache {
 
     /// Mark all solutions for the given strategy as not-current (prior to
     /// a new wizard run).
-    pub fn clear_current_solutions(&self, strategy: &str) -> anyhow::Result<()> {
+    pub fn clear_current_solutions(
+        &self,
+        strategy: &str,
+        eu_destination: bool,
+    ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE wizard_solutions SET is_current = 0 WHERE strategy = ?1",
-            rusqlite::params![strategy],
+            "UPDATE wizard_solutions SET is_current = 0 WHERE strategy = ?1 AND eu_destination = ?2",
+            rusqlite::params![strategy, eu_destination as i64],
         )?;
         Ok(())
     }
@@ -344,9 +354,10 @@ impl Cache {
     /// fetch — those solutions were computed on stale data.
     pub fn prune_stale_solutions(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
-        let latest_fetch: Option<i64> = conn
-            .query_row("SELECT MAX(fetched_at) FROM listings", [], |row| row.get(0))
-            .optional()?;
+        let latest_fetch = conn.query_row("SELECT MAX(fetched_at) FROM listings", [], |row| {
+            row.get::<_, Option<i64>>(0)
+        });
+        let latest_fetch = optional(latest_fetch)?;
 
         if let Some(cutoff) = latest_fetch {
             conn.execute(
@@ -357,40 +368,73 @@ impl Cache {
         Ok(())
     }
 
+    /// Delete all wizard solutions if any listings reference blacklisted
+    /// sellers.  This catches stale solutions after a blacklist change
+    /// without requiring a full scraper re-run.
+    pub fn prune_blacklisted_solutions(&self) -> anyhow::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+
+        // Collect distinct store names from listings.
+        let mut stmt = conn.prepare("SELECT DISTINCT store_name FROM listings")?;
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let has_blacklisted = names
+            .iter()
+            .any(|n| shipping::is_blacklisted(shipping::extract_seller_name(n)));
+
+        if has_blacklisted {
+            // Only delete non-EU solutions — blacklisted sellers may still
+            // ship within the EU, so EU-destination solutions are valid.
+            let deleted =
+                conn.execute("DELETE FROM wizard_solutions WHERE eu_destination = 0", [])?;
+            // Also delete the blacklisted listings themselves so this is a
+            // one-time cleanup — the next scraper run will re-fetch them,
+            // but the wizard won't keep re-pruning on every invocation.
+            for name in &names {
+                if shipping::is_blacklisted(shipping::extract_seller_name(name)) {
+                    conn.execute(
+                        "DELETE FROM listings WHERE store_name = ?1",
+                        rusqlite::params![name],
+                    )?;
+                }
+            }
+            return Ok(deleted);
+        }
+
+        Ok(0)
+    }
+
     /// Load the best-ever solution (lowest total_cost) for each tolerance
-    /// of the given strategy.  Returns a map: tolerance → record.
+    /// of the given strategy and EU destination.  Returns a map: tolerance → record.
     pub fn load_best_solutions(
         &self,
         strategy: &str,
+        eu_destination: bool,
     ) -> anyhow::Result<HashMap<usize, WizardHistory>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT tolerance, num_stores, num_found, num_skipped,
-                    total_card_cost, total_shipping, total_cost,
-                    per_card_cost, assignments_json, created_at, is_current
+            "SELECT tolerance, num_stores, num_skipped,
+                    total_cost, assignments_json
              FROM wizard_solutions
-             WHERE strategy = ?1
+             WHERE strategy = ?1 AND eu_destination = ?2
              ORDER BY total_cost ASC",
         )?;
 
         let mut map = HashMap::new();
         let rows: Vec<WizardHistory> = stmt
-            .query_map(rusqlite::params![strategy], |row| {
-                let json_str: String = row.get(8)?;
+            .query_map(rusqlite::params![strategy, eu_destination as i64], |row| {
+                let json_str: String = row.get(4)?;
                 let raw_choices: Vec<Option<usize>> =
                     serde_json::from_str(&json_str).unwrap_or_default();
                 Ok(WizardHistory {
                     tolerance: row.get::<_, i64>(0)? as usize,
                     num_stores: row.get::<_, i64>(1)? as usize,
-                    num_found: row.get::<_, i64>(2)? as usize,
-                    num_skipped: row.get::<_, i64>(3)? as usize,
-                    total_card_cost: row.get::<_, i64>(4)? as u64,
-                    total_shipping: row.get::<_, i64>(5)? as u64,
-                    total_cost: row.get::<_, i64>(6)? as u64,
-                    per_card_cost: row.get::<_, i64>(7)? as u64,
+                    num_skipped: row.get::<_, i64>(2)? as usize,
+                    total_cost: row.get::<_, i64>(3)? as u64,
                     raw_choices,
-                    created_at: row.get(9)?,
-                    is_current: row.get::<_, i64>(10)? != 0,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -414,16 +458,11 @@ fn epoch_secs() -> i64 {
         .as_secs() as i64
 }
 
-trait OptionalExt<T> {
-    fn optional(self) -> Result<Option<T>, rusqlite::Error>;
-}
-
-impl<T> OptionalExt<T> for Result<T, rusqlite::Error> {
-    fn optional(self) -> Result<Option<T>, rusqlite::Error> {
-        match self {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
+/// Convert `QueryReturnedNoRows` into `Ok(None)`, propagate other errors.
+fn optional<T>(result: Result<T, rusqlite::Error>) -> Result<Option<T>, rusqlite::Error> {
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
     }
 }

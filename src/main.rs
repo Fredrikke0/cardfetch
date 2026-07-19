@@ -1,5 +1,6 @@
 mod cache;
 mod output;
+mod server;
 mod shipping;
 mod stores;
 mod wizard;
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use stores::{StoreResult, DELAY_JITTER_MS, DELAY_MS};
-use wizard::{Strategy, WizardConfig};
+use wizard::{compute_raw_score, Strategy, WizardConfig};
 
 /// Fetch MTG card availability from online stores.
 #[derive(Parser)]
@@ -24,8 +25,9 @@ use wizard::{Strategy, WizardConfig};
 struct Cli {
     /// Path to a decklist file, or a single card name in quotes
     /// (e.g. --input cards.txt  or  --input "Lightning Bolt").
-    #[arg(short, long)]
-    input: String,
+    /// Not required in --server mode.
+    #[arg(short, long, required_unless_present = "server")]
+    input: Option<String>,
 
     /// Bypass the cache and perform a fresh live search
     #[arg(long)]
@@ -72,15 +74,53 @@ struct Cli {
     /// possible store assignment to guarantee the optimal solution.
     #[arg(long)]
     exhaustive: bool,
+
+    /// Start in HTTP API server mode instead of running a one-shot search.
+    #[arg(long)]
+    server: bool,
+
+    /// Port for the HTTP server (only used with --server).
+    #[arg(long, default_value = "3000")]
+    port: u16,
 }
 
 fn main() -> anyhow::Result<()> {
-    let started = Instant::now();
     let cli = Cli::parse();
+
+    // Server mode: start HTTP API and block forever.
+    if cli.server {
+        let stores = Arc::new(stores::all_stores(cli.verbose));
+        let cache = if cli.no_cache {
+            None
+        } else {
+            Some(Arc::new(Cache::open("cache.db")?))
+        };
+
+        let state = Arc::new(server::AppState::new(stores, cache));
+        let app = server::build_router(state);
+
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], cli.port));
+        eprintln!("CardFetch API server on http://{addr}");
+        eprintln!("  GET  /stores");
+        eprintln!("  POST /fetch");
+        eprintln!("  POST /wizard");
+        eprintln!("  GET  /jobs/{{id}}");
+
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            axum::serve(listener, app).await?;
+            anyhow::Ok(())
+        })?;
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    let input = cli.input.as_ref().unwrap();
 
     // ── Read cards: --input is either a file path or a card name ──────
     let cards: Vec<String> = {
-        let path = PathBuf::from(&cli.input);
+        let path = PathBuf::from(&input);
         if path.is_file() {
             let contents = std::fs::read_to_string(&path).map_err(|e| {
                 anyhow::anyhow!("Failed to read input file '{}': {}", path.display(), e)
@@ -93,7 +133,7 @@ fn main() -> anyhow::Result<()> {
                 .collect()
         } else {
             // Not a file — treat as a single card name
-            vec![cli.input.trim().to_string()]
+            vec![input.trim().to_string()]
         }
     };
 
@@ -112,7 +152,7 @@ fn main() -> anyhow::Result<()> {
         let listings = cache.get_listings(&unique_cards)?;
 
         if listings.is_empty() {
-            let hint = format!("cardfetch --input {}", cli.input);
+            let hint = format!("cardfetch --input {}", input);
             eprintln!(
                 "No cached listings found for the requested cards.\n\
                  Run a normal search first: {hint}"
@@ -125,9 +165,16 @@ fn main() -> anyhow::Result<()> {
             Strategy::Cheapest => "cheapest",
         };
 
-        // Prune solutions computed on stale data and reset current-run flags.
+        // Prune solutions computed on stale data, solutions referencing
+        // now-blacklisted sellers, and reset current-run flags.
         cache.prune_stale_solutions()?;
-        cache.clear_current_solutions(strategy_name)?;
+        let pruned = cache.prune_blacklisted_solutions()?;
+        if pruned > 0 {
+            eprintln!(
+                "  [wizard] dropped {pruned} cached solution(s) — they referenced blacklisted sellers"
+            );
+        }
+        cache.clear_current_solutions(strategy_name, cli.eu_destination)?;
 
         // Build input once — warn about uncached cards once.
         let input = wizard::WizardInput::from_results_and_wants(
@@ -159,17 +206,79 @@ fn main() -> anyhow::Result<()> {
             .progress_chars("#>-"),
         );
 
+        // Pre-compute exhaustive candidates once — they only depend on
+        // `input`, not on the per-tolerance `config`.
+        let exhaustive_candidates = if cli.exhaustive {
+            Some(wizard::select_candidate_stores(&input))
+        } else {
+            None
+        };
+
+        // Load previous bests from BOTH strategies before the loop so we can
+        // seed each tolerance from the better of current vs. cached.
+        let other_strategy = match strategy_name {
+            "cheapest" => "simplest",
+            "simplest" => "cheapest",
+            _ => strategy_name,
+        };
+        let mut prev_history = cache.load_best_solutions(strategy_name, cli.eu_destination)?;
+        let other_history = cache.load_best_solutions(other_strategy, cli.eu_destination)?;
+        for (t, rec) in other_history {
+            match prev_history.get(&t) {
+                Some(existing) if rec.total_cost < existing.total_cost => {
+                    prev_history.insert(t, rec);
+                }
+                None => {
+                    prev_history.insert(t, rec);
+                }
+                _ => {}
+            }
+        }
+        if !prev_history.is_empty() {
+            eprintln!(
+                "  [wizard] {} previous solutions on record (both strategies)",
+                prev_history.len()
+            );
+        }
+
         let mut solutions: Vec<(usize, wizard::WizardSolution)> = Vec::new();
-        let mut prev_choices: Option<Vec<Option<usize>>> = None;
+        let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
         for t in 0..=cli.tolerance {
+            if let Some(ref candidates) = exhaustive_candidates {
+                search_mode = wizard::SearchMode::Exhaustive {
+                    candidates: candidates.clone(),
+                };
+            }
             let config = WizardConfig {
                 strategy: cli.strategy,
                 tolerance: t,
-                eu_destination: cli.eu_destination,
             };
-            let seed = prev_choices.as_deref();
-            if let Some(sol) = wizard::optimize_input(&input, &config, cli.exhaustive, seed) {
-                prev_choices = Some(sol.raw_choices.clone());
+            if let Some(sol) = wizard::optimize_input(&input, &config, &search_mode) {
+                // Seed the heuristic path for the next tolerance from whichever
+                // is better: the current run's solution or a previously cached
+                // solution at this tolerance.
+                if exhaustive_candidates.is_none() {
+                    let seed_choices = match prev_history.get(&t) {
+                        Some(prev) => {
+                            let prev_score = compute_raw_score(
+                                prev.total_cost,
+                                prev.num_stores,
+                                prev.num_skipped,
+                                t,
+                                cli.strategy,
+                            );
+                            if prev_score < sol.score {
+                                prev.raw_choices.clone()
+                            } else {
+                                sol.raw_choices.clone()
+                            }
+                        }
+                        None => sol.raw_choices.clone(),
+                    };
+                    search_mode = wizard::SearchMode::Heuristic {
+                        seed: Some(seed_choices),
+                    };
+                }
                 solutions.push((t, sol));
             }
             bar.inc(1);
@@ -179,59 +288,26 @@ fn main() -> anyhow::Result<()> {
         if solutions.is_empty() {
             eprintln!("No valid solutions found.");
         } else {
-            let total_cards = unique_cards.len();
-
-            // Load previous bests from BOTH strategies — a great Simplest
-            // solution is also a valid (and often great) Cheapest solution.
-            let other_strategy = match strategy_name {
-                "cheapest" => "simplest",
-                "simplest" => "cheapest",
-                _ => strategy_name,
-            };
-            let mut prev_history = cache.load_best_solutions(strategy_name)?;
-            let other_history = cache.load_best_solutions(other_strategy)?;
-            // Merge: for each tolerance, keep whichever strategy's record has
-            // the lower total_cost.
-            for (t, rec) in other_history {
-                match prev_history.get(&t) {
-                    Some(existing) if rec.total_cost < existing.total_cost => {
-                        prev_history.insert(t, rec);
-                    }
-                    None => {
-                        prev_history.insert(t, rec);
-                    }
-                    _ => {}
-                }
-            }
-            eprintln!(
-                "  [wizard] {} previous solutions on record (both strategies)",
-                prev_history.len()
-            );
-
             // Save only if current beats previous (or no previous exists).
             // Then build the merged display list.
             let mut merged: Vec<(usize, wizard::WizardSolution)> = Vec::new();
             for (t, cur_sol) in &solutions {
-                let found = total_cards - cur_sol.skipped.len();
-                let cur_total = cur_sol.total_card_cost + cur_sol.total_shipping;
-
                 let is_better = match prev_history.get(t) {
-                    Some(prev) => cur_total < prev.total_cost,
+                    Some(prev) => {
+                        let prev_score = compute_raw_score(
+                            prev.total_cost,
+                            prev.num_stores,
+                            prev.num_skipped,
+                            *t,
+                            cli.strategy,
+                        );
+                        cur_sol.score < prev_score
+                    }
                     None => true, // no previous record
                 };
 
                 if is_better {
-                    cache.save_wizard_solution(
-                        strategy_name,
-                        *t,
-                        cur_sol.num_stores,
-                        found,
-                        cur_sol.skipped.len(),
-                        cur_sol.total_card_cost,
-                        cur_sol.total_shipping,
-                        cur_total,
-                        &cur_sol.raw_choices,
-                    )?;
+                    cache.save_wizard_solution(strategy_name, *t, cli.eu_destination, cur_sol)?;
                     merged.push((*t, cur_sol.clone()));
                 } else {
                     // Previous solution is better — reconstruct and display it.
@@ -239,7 +315,6 @@ fn main() -> anyhow::Result<()> {
                     let config = WizardConfig {
                         strategy: cli.strategy,
                         tolerance: *t,
-                        eu_destination: cli.eu_destination,
                     };
                     let reconstructed =
                         wizard::solution_from_choices(&prev.raw_choices, &input, &config);
@@ -247,7 +322,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            output::print_wizard_summary(&merged, strategy_name, &unique_cards, &prev_history);
+            output::print_wizard_summary(&merged, strategy_name, &unique_cards, cli.eu_destination);
         }
 
         eprintln!(
@@ -428,15 +503,34 @@ fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                 } else {
-                                    for result in &sub_results {
-                                        if let Some(ref cache) = cache {
+                                    // Group results by store_name before caching.
+                                    // A seller may have multiple offers for the
+                                    // same card (different conditions/versions);
+                                    // cache.store() DELETEs all old rows for the
+                                    // (card_name, store_name) pair first, so
+                                    // calling it per-result would keep only the
+                                    // last (most expensive) offer.
+                                    if let Some(ref cache) = cache {
+                                        let mut by_store: std::collections::HashMap<
+                                            String,
+                                            Vec<StoreResult>,
+                                        > = std::collections::HashMap::new();
+                                        for result in &sub_results {
+                                            by_store
+                                                .entry(result.store_name.clone())
+                                                .or_default()
+                                                .push(result.clone());
+                                        }
+                                        for (store_name, grouped) in &by_store {
                                             let _ = cache.store(
                                                 card_name,
-                                                &result.store_name,
-                                                Some(std::slice::from_ref(result)),
+                                                store_name,
+                                                Some(grouped.as_slice()),
                                             );
                                         }
-                                        results_to_send.push(result.clone());
+                                    }
+                                    for result in sub_results {
+                                        results_to_send.push(result);
                                     }
                                 }
                             }

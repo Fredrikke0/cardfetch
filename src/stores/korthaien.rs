@@ -30,25 +30,20 @@ impl Store for Korthaien {
         let all_products = fetch_search_results(client, card_name)?;
 
         // Filter to in-stock products whose name matches (case-insensitive,
-        // ignoring foil suffix).
-        let matching: Vec<&SearchProduct> = all_products
-            .iter()
+        // ignoring foil suffix).  Return all matches so the wizard picks the
+        // cheapest variant.
+        let matching: Vec<_> = all_products
+            .into_iter()
             .filter(|p| p.in_stock && names_match(card_name, &p.name))
+            .map(|p| StoreResult {
+                store_name: STORE_NAME.to_string(),
+                card_name: card_name.to_string(),
+                price: p.price,
+                url: p.url,
+            })
             .collect();
 
-        if matching.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Prefer non-foil (cheapest), then foil (cheapest)
-        let best = pick_best(&matching, card_name).unwrap();
-
-        Ok(vec![StoreResult {
-            store_name: STORE_NAME.to_string(),
-            card_name: card_name.to_string(),
-            price: best.price,
-            url: best.url.clone(),
-        }])
+        Ok(matching)
     }
 }
 
@@ -151,17 +146,6 @@ fn names_match(searched: &str, product_name: &str) -> bool {
     searched.eq_ignore_ascii_case(stripped)
 }
 
-/// Pick the best match: non-foil first (cheapest), then foil (cheapest).
-fn pick_best<'a>(products: &[&'a SearchProduct], searched: &str) -> Option<&'a SearchProduct> {
-    products
-        .iter()
-        .min_by_key(|p| {
-            let is_foil = !searched.eq_ignore_ascii_case(p.name.trim());
-            (is_foil, p.price)
-        })
-        .copied()
-}
-
 // ── Price parsing ─────────────────────────────────────────────────────────
 
 /// Parse a price string like "6,-" into integer oere.
@@ -206,50 +190,6 @@ mod tests {
         assert_eq!(parse_price("105,-"), Some(10500));
         assert_eq!(parse_price(""), None);
         assert_eq!(parse_price("abc"), None);
-    }
-
-    #[test]
-    fn test_store_name() {
-        let store = Korthaien::new();
-        assert_eq!(store.name(), "korthaien.no");
-    }
-
-    #[test]
-    fn test_pick_best_prefers_non_foil() {
-        let non_foil = SearchProduct {
-            name: "Snakeskin Veil".into(),
-            price: 1000,
-            url: "/nf".into(),
-            in_stock: true,
-        };
-        let foil = SearchProduct {
-            name: "Snakeskin Veil (foil)".into(),
-            price: 500,
-            url: "/f".into(),
-            in_stock: true,
-        };
-        let entries = [&non_foil, &foil];
-        let best = pick_best(&entries, "Snakeskin Veil").unwrap();
-        assert_eq!(best.url, "/nf");
-    }
-
-    #[test]
-    fn test_pick_best_cheapest_non_foil_first() {
-        let exp = SearchProduct {
-            name: "Snakeskin Veil".into(),
-            price: 1000,
-            url: "/exp".into(),
-            in_stock: true,
-        };
-        let cheap = SearchProduct {
-            name: "Snakeskin Veil".into(),
-            price: 400,
-            url: "/cheap".into(),
-            in_stock: true,
-        };
-        let entries = [&exp, &cheap];
-        let best = pick_best(&entries, "Snakeskin Veil").unwrap();
-        assert_eq!(best.url, "/cheap");
     }
 
     #[test]

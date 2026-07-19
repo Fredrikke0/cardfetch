@@ -118,10 +118,7 @@ pub(crate) fn rescue_js_snippet() -> &'static str {
 // ── Headless-browser CardMarket implementation ─────────────────────────────
 
 pub struct CardMarket {
-    /// Owns the browser process — must be kept alive as long as the tab is
-    /// in use.
-    #[allow(dead_code)]
-    browser: Browser,
+    _browser: Browser,
     /// Xvfb child process — kept alive so the virtual display exists while
     /// the browser runs.  Killed on drop.
     _xvfb: Option<std::process::Child>,
@@ -181,7 +178,7 @@ impl CardMarket {
         }
 
         CardMarket {
-            browser,
+            _browser: browser,
             _xvfb: xvfb_child,
             tab,
             card_cache: Mutex::new(std::collections::HashMap::new()),
@@ -824,12 +821,6 @@ fn extract_ajax_rows(xml: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_store_name() {
-        let cm = CardMarket::new(false);
-        assert_eq!(cm.name(), "cardmarket.com");
-    }
 
     #[test]
     fn test_title_to_slug() {

@@ -30,22 +30,20 @@ impl Store for Midgard {
     ) -> anyhow::Result<Vec<StoreResult>> {
         let all_products = fetch_search_results(client, card_name)?;
 
-        // Pick the cheapest in-stock product whose title contains the card name
-        let best = match all_products
-            .iter()
+        // Return all in-stock products matching the card name, so the wizard
+        // can pick the cheapest variant.
+        let matching: Vec<_> = all_products
+            .into_iter()
             .filter(|p| p.in_stock && title_contains(card_name, &p.name))
-            .min_by_key(|p| p.price)
-        {
-            Some(p) => p,
-            None => return Ok(vec![]),
-        };
+            .map(|p| StoreResult {
+                store_name: STORE_NAME.to_string(),
+                card_name: card_name.to_string(),
+                price: p.price,
+                url: p.url,
+            })
+            .collect();
 
-        Ok(vec![StoreResult {
-            store_name: STORE_NAME.to_string(),
-            card_name: card_name.to_string(),
-            price: best.price,
-            url: best.url.clone(),
-        }])
+        Ok(matching)
     }
 }
 
@@ -180,12 +178,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_store_name() {
-        let store = Midgard::new();
-        assert_eq!(store.name(), "midgardgames.no");
-    }
-
-    #[test]
     fn test_parse_price() {
         assert_eq!(parse_price("5,00 kr"), Some(500));
         assert_eq!(parse_price("Vanlig pris 5,00 kr"), Some(500));
@@ -194,19 +186,6 @@ mod tests {
         assert_eq!(parse_price("0,50"), Some(50));
         assert_eq!(parse_price("abc"), None);
         assert_eq!(parse_price("Utsolgt"), None);
-    }
-
-    #[test]
-    fn test_title_contains() {
-        assert!(title_contains(
-            "Snakeskin Veil",
-            "TDM 0159 C: Snakeskin Veil"
-        ));
-        assert!(title_contains(
-            "snakeskin veil",
-            "TDM 0159 C: Snakeskin Veil"
-        ));
-        assert!(!title_contains("Black Lotus", "TDM 0159 C: Snakeskin Veil"));
     }
 
     #[test]

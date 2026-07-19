@@ -10,9 +10,9 @@ pub mod pokeboks;
 use anyhow::Result;
 
 /// Minimum shared delay between requests across all stores (in milliseconds).
-pub const DELAY_MS: u64 = 400;
+pub const DELAY_MS: u64 = 300;
 /// Extra random jitter added on top of DELAY_MS (in milliseconds).
-pub const DELAY_JITTER_MS: u64 = 600;
+pub const DELAY_JITTER_MS: u64 = 300;
 
 /// A single result from a store search for one card.
 #[derive(Debug, Clone)]

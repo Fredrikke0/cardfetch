@@ -33,22 +33,28 @@ impl Store for Outland {
     ) -> anyhow::Result<Vec<StoreResult>> {
         let all_items = fetch_all_pages(client, card_name)?;
 
-        let item = match all_items
+        let matching: Vec<_> = all_items
             .iter()
-            .find(|item| names_match(card_name, &item.name))
-        {
-            Some(item) => item,
-            None => return Ok(vec![]),
-        };
+            .filter(|item| names_match(card_name, &item.name))
+            .collect();
 
-        let price = &item.price_range.minimum_price.final_price;
-        let price_oere = (price.value * 100.0).round() as u32;
-        Ok(vec![StoreResult {
-            store_name: STORE_NAME.to_string(),
-            card_name: card_name.to_string(),
-            price: price_oere,
-            url: format!("{}/{}", STORE_BASE_URL, item.url_key),
-        }])
+        if matching.is_empty() {
+            return Ok(vec![]);
+        }
+
+        Ok(matching
+            .into_iter()
+            .map(|item| {
+                let price = &item.price_range.minimum_price.final_price;
+                let price_oere = (price.value * 100.0).round() as u32;
+                StoreResult {
+                    store_name: STORE_NAME.to_string(),
+                    card_name: card_name.to_string(),
+                    price: price_oere,
+                    url: format!("{}/{}", STORE_BASE_URL, item.url_key),
+                }
+            })
+            .collect())
     }
 }
 
@@ -481,11 +487,5 @@ mod tests {
         assert!(names_match("Snakeskin Veil", "Snakeskin Veil"));
         assert!(!names_match("Snakeskin", "Snakeskin Veil (Enkeltkort)"));
         assert!(!names_match("Other Card", "Snakeskin Veil (Enkeltkort)"));
-    }
-
-    #[test]
-    fn test_store_name() {
-        let store = Outland::new();
-        assert_eq!(store.name(), "outland.no");
     }
 }

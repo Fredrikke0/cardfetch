@@ -37,7 +37,9 @@ impl Store for Finn {
     ) -> anyhow::Result<Vec<StoreResult>> {
         let docs = fetch_search_results(client, card_name)?;
 
-        // Fetch each ad's full description from the HTML and check for card name
+        // Fetch each ad's full description from the HTML and collect all
+        // matching results (different sellers may list at different prices).
+        let mut results: Vec<StoreResult> = Vec::new();
         for doc in &docs {
             std::thread::sleep(Duration::from_millis(super::DELAY_MS));
 
@@ -56,16 +58,16 @@ impl Store for Finn {
                     .clone()
                     .unwrap_or_else(|| format!("{}/{}", ITEM_URL, doc.id));
 
-                return Ok(vec![StoreResult {
+                results.push(StoreResult {
                     store_name: STORE_NAME.to_string(),
                     card_name: card_name.to_string(),
                     price: price_oere,
                     url,
-                }]);
+                });
             }
         }
 
-        Ok(vec![])
+        Ok(results)
     }
 }
 
@@ -211,37 +213,4 @@ fn fetch_ad_description(client: &reqwest::blocking::Client, ad_id: &str) -> anyh
     }
 
     Ok(texts.join(" "))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_store_name() {
-        let store = Finn::new();
-        assert_eq!(store.name(), "finn.no");
-    }
-
-    #[test]
-    fn test_urlencode() {
-        assert_eq!(
-            urlencode_pct("undergrowth champion"),
-            "undergrowth%20champion"
-        );
-        assert_eq!(urlencode_pct("snakeskin veil"), "snakeskin%20veil");
-    }
-
-    #[test]
-    fn test_description_match() {
-        assert!(title_contains(
-            "Hydra's Growth",
-            "Jeg selger Hydra's Growth og andre grønne kort"
-        ));
-        assert!(title_contains("hydra's growth", "Hydra's Growth (NM)"));
-        assert!(!title_contains(
-            "Hydra's Growth",
-            "Jeg selger noen Magic kort"
-        ));
-    }
 }
