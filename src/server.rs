@@ -549,6 +549,11 @@ async fn start_wizard(
         )
     })?;
 
+    // Prune wizard solutions computed on stale listing data before
+    // checking the cache — this prevents solutions from a different
+    // card set from being reused.
+    let _ = cache.prune_stale_solutions();
+
     let listings = cache.get_listings(&cards).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -580,7 +585,13 @@ async fn start_wizard(
             )
         })?;
 
-    if !cached.is_empty() {
+    // Only use cached solutions if they were computed for the same number
+    // of cards as the current request, otherwise the choices vector will
+    // be silently truncated/padded by solution_from_choices.
+    let card_count_match = cached
+        .first()
+        .is_some_and(|(h, _)| h.raw_choices.len() == cards.len());
+    if !cached.is_empty() && card_count_match {
         let can_use_cache =
             cached.iter().any(|(_, was_exhaustive)| *was_exhaustive) || !req.exhaustive;
         if can_use_cache {
