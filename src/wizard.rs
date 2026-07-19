@@ -1041,6 +1041,12 @@ pub(crate) fn select_candidate_stores(input: &WizardInput) -> Vec<usize> {
     // card S carries, T also carries it at ≤ price.  A dominated store
     // can never improve a solution: swapping it for its dominator never
     // increases card cost, shipping cost, or loses coverage.
+    //
+    // Skip for single-card searches — every store that carries the card
+    // is a distinct alternative the user wants to see.
+    if input.card_count() <= 1 {
+        return candidates;
+    }
     let n_cards = input.card_count();
     let mut dominated: HashSet<usize> = HashSet::new();
     for (i, &si) in candidates.iter().enumerate() {
