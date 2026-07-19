@@ -64,7 +64,7 @@ impl Store for Finn {
                     .unwrap_or_else(|| format!("{}/{}", ITEM_URL, doc.id));
 
                 results.push(StoreResult {
-                    store_name: format!("{}: {}", STORE_NAME, detail.seller_name),
+                    store_name: STORE_NAME.to_string(),
                     card_name: card_name.to_string(),
                     price: price_oere,
                     url,
@@ -181,11 +181,11 @@ fn fetch_search_results(
 
 struct AdDetail {
     description: String,
-    seller_name: String,
 }
 
-/// Fetch an ad page and extract the full description and seller name
-/// from the rendered HTML.
+/// Fetch an ad page and extract the full description from the rendered HTML.
+/// Note: FINN.no requires login to view seller profiles, so seller names
+/// are not extracted.
 fn fetch_ad_detail(client: &reqwest::blocking::Client, ad_id: &str) -> anyhow::Result<AdDetail> {
     let url = format!("{}/{}", ITEM_URL, ad_id);
 
@@ -227,78 +227,5 @@ fn fetch_ad_detail(client: &reqwest::blocking::Client, ad_id: &str) -> anyhow::R
     }
     let description = texts.join(" ");
 
-    // Extract seller name from profile link
-    let seller_name = extract_seller_name(&document);
-
-    Ok(AdDetail {
-        description,
-        seller_name,
-    })
-}
-
-/// Try to extract the seller's display name from the ad page.
-/// Tries multiple strategies in order of reliability.
-/// Falls back to "unknown" if no name can be found.
-fn extract_seller_name(document: &scraper::Html) -> String {
-    // Strategy 1: JSON-LD structured data (Product > seller > name)
-    if let Some(name) = extract_from_ld_json(document) {
-        if !name.is_empty() {
-            return name;
-        }
-    }
-
-    // Strategy 2: Profile link in the seller section.
-    // Finn recommence uses href="/profile/ads?userId=..." with the seller name as text.
-    // Scope to links that are inside a profile/seller context by preferring
-    // the more specific "/profile/ads" pattern first.
-    let selectors = [
-        "a[href*='/profile/ads']",
-        "a[href*='/profile/']",
-        "a[href*='/profil/']",
-        "a[href*='/user/']",
-    ];
-    for sel_str in &selectors {
-        if let Ok(sel) = scraper::Selector::parse(sel_str) {
-            for el in document.select(&sel) {
-                let name = el.text().collect::<String>().trim().to_string();
-                if !name.is_empty() && name.len() < 80 {
-                    return name;
-                }
-            }
-        }
-    }
-
-    "unknown".to_string()
-}
-
-/// Try to extract seller name from JSON-LD structured data.
-fn extract_from_ld_json(document: &scraper::Html) -> Option<String> {
-    let sel = scraper::Selector::parse("script[type='application/ld+json']").ok()?;
-
-    for el in document.select(&sel) {
-        let json_str: String = el.text().collect();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-            // Try Product.seller.name
-            if let Some(name) = value
-                .get("seller")
-                .and_then(|s| s.get("name"))
-                .and_then(|n| n.as_str())
-            {
-                return Some(name.to_string());
-            }
-            // Try @graph array (sometimes used for multiple entities)
-            if let Some(graph) = value.get("@graph").and_then(|g| g.as_array()) {
-                for item in graph {
-                    if let Some(name) = item
-                        .get("seller")
-                        .and_then(|s| s.get("name"))
-                        .and_then(|n| n.as_str())
-                    {
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
+    Ok(AdDetail { description })
 }

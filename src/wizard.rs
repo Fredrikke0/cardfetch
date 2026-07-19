@@ -1345,9 +1345,10 @@ fn score_store_subset(
         .map(|((&si, &total), &count)| input.shipping_cost(si, total, count))
         .sum();
 
+    let num_stores_used = card_counts[..k].iter().filter(|&&c| c > 0).count();
     compute_raw_score(
         card_total + shipping,
-        k,
+        num_stores_used,
         num_skipped,
         config.tolerance,
         config.strategy,

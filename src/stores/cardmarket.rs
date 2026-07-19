@@ -117,13 +117,31 @@ pub(crate) fn rescue_js_snippet() -> &'static str {
 
 // ── Headless-browser CardMarket implementation ─────────────────────────────
 
-pub struct CardMarket {
-    _browser: Browser,
-    _xvfb: Option<std::process::Child>,
+/// Holds a running Chrome browser, its virtual display, and the reusable tab.
+/// Wrapped in `Mutex<Option<...>>` so it can be lazily created and recreated
+/// if the browser dies while idle in long-running server mode.
+struct BrowserSession {
+    #[allow(dead_code)]
+    browser: Browser,
     tab: Arc<headless_chrome::Tab>,
-    /// Serializes access to the single browser tab so concurrent server
-    /// fetch jobs don't race on `navigate_to` / `wait_until_navigated`.
-    tab_lock: Mutex<()>,
+    xvfb: Option<std::process::Child>,
+}
+
+impl Drop for BrowserSession {
+    fn drop(&mut self) {
+        let _ = self.tab.close(false);
+        if let Some(ref mut child) = self.xvfb {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+pub struct CardMarket {
+    /// Serializes access to the single browser tab and holds the browser
+    /// session itself.  `None` means the browser hasn't been started yet
+    /// or it died and needs to be recreated.
+    session: Mutex<Option<BrowserSession>>,
     card_cache: Mutex<std::collections::HashMap<String, CardResults>>,
     verbose: bool,
 }
@@ -137,22 +155,30 @@ struct CardResults {
 
 impl CardMarket {
     pub fn new(verbose: bool) -> Self {
-        // Try to start a virtual X display via Xvfb.
-        // Cloudflare detects true headless Chrome; running on Xvfb makes
-        // Chrome indistinguishable from a normal desktop browser.
+        CardMarket {
+            // Browser is created lazily on the first fetch request.
+            // This avoids keeping a Chrome process alive indefinitely
+            // in long-running server mode.
+            session: Mutex::new(None),
+            card_cache: Mutex::new(std::collections::HashMap::new()),
+            verbose,
+        }
+    }
+
+    /// Lazily create a `BrowserSession` (Chrome + Xvfb + tab).
+    /// Must be called while holding the `session` lock.
+    fn create_session(verbose: bool) -> anyhow::Result<BrowserSession> {
         let (xvfb_child, display) = start_xvfb(verbose);
 
         if let Some(ref d) = display {
             std::env::set_var("DISPLAY", d);
         } else {
-            // No Xvfb — we're falling back to headless.  Unset DISPLAY so
-            // Chrome doesn't latch onto the real desktop (e.g. :0).
             std::env::remove_var("DISPLAY");
         }
 
         let launch_opts = LaunchOptions::default_builder()
-            .headless(display.is_none()) // headless only if no Xvfb
-            .sandbox(false) // Often needed on Linux
+            .headless(display.is_none())
+            .sandbox(false)
             .window_size(Some((1920, 1080)))
             .args(vec![
                 std::ffi::OsStr::new("--disable-dev-shm-usage"),
@@ -165,19 +191,12 @@ impl CardMarket {
             .build()
             .expect("Failed to build Chrome launch options");
 
-        let browser = Browser::new(launch_opts).expect(
-            "Failed to launch Chrome. Is google-chrome or chromium installed?\n\
-             On Linux, also ensure Xvfb is available: apt install xvfb",
-        );
+        let browser = Browser::new(launch_opts)
+            .context("Failed to launch Chrome. Is google-chrome or chromium installed?")?;
 
-        // Create one reusable tab that lives for the entire store session.
-        let tab = browser.new_tab().expect("Failed to create browser tab");
+        let tab = browser.new_tab().context("Failed to create browser tab")?;
 
-        // Warm up the tab: Chrome 150's first-run welcome screen can
-        // replace the initial about:blank.  Navigating explicitly to
-        // about:blank and waiting forces the tab into a stable state.
-        // Errors here are not fatal — the tab may still work for the
-        // first real CardMarket navigation.
+        // Warm up the tab.
         let _ = tab.navigate_to("about:blank");
         let _ = tab.wait_until_navigated();
         if verbose {
@@ -192,25 +211,37 @@ impl CardMarket {
             }
         }
 
-        CardMarket {
-            _browser: browser,
-            _xvfb: xvfb_child,
+        Ok(BrowserSession {
+            browser,
             tab,
-            tab_lock: Mutex::new(()),
-            card_cache: Mutex::new(std::collections::HashMap::new()),
-            verbose,
-        }
+            xvfb: xvfb_child,
+        })
     }
-}
 
-impl Drop for CardMarket {
-    fn drop(&mut self) {
-        // Close the reusable tab so the browser page doesn't leak.
-        let _ = self.tab.close(false);
-        if let Some(ref mut child) = self._xvfb {
-            let _ = child.kill();
-            let _ = child.wait();
+    /// Ensure a browser session exists, creating one if necessary.
+    /// Returns a reference to the tab.  The caller must be holding the
+    /// `session` lock and must keep it locked while using the tab.
+    fn ensure_tab(
+        session_guard: &mut Option<BrowserSession>,
+        verbose: bool,
+    ) -> anyhow::Result<Arc<headless_chrome::Tab>> {
+        if session_guard.is_none() {
+            if verbose {
+                eprintln!("  [cardmarket] starting browser (lazy init)...");
+            }
+            *session_guard = Some(Self::create_session(verbose)?);
         }
+        // Unwrap safe: we just ensured it's Some
+        Ok(session_guard.as_ref().unwrap().tab.clone())
+    }
+
+    /// Check whether an error indicates the browser process has died.
+    fn is_browser_dead(err: &anyhow::Error) -> bool {
+        let msg = err.to_string().to_lowercase();
+        msg.contains("connection is closed")
+            || msg.contains("connection closed")
+            || msg.contains("no such tab")
+            || msg.contains("browser has been closed")
     }
 }
 
@@ -299,9 +330,11 @@ impl Store for CardMarket {
         if is_blocked() {
             return Ok(vec![]);
         }
-        let _tab_guard = self.tab_lock.lock().unwrap();
+        // Serialize and ensure browser session.
+        let mut session_guard = self.session.lock().unwrap();
+        let tab = Self::ensure_tab(&mut *session_guard, self.verbose)?;
         let slug = title_to_slug(card_name);
-        let results = self.fetch_all_in_one_tab(&self.tab, card_name, &slug)?;
+        let results = self.fetch_all_in_one_tab(&tab, card_name, &slug)?;
         let mut all = results.norwegian;
         all.extend(results.int_powerseller);
         all.extend(results.int_private);
@@ -318,10 +351,9 @@ impl Store for CardMarket {
             return Ok(vec![]);
         }
 
-        // Serialize access to the single shared browser tab.  Multiple
-        // concurrent fetch jobs share one CardMarket instance — only
-        // one thread may use the tab at a time.
-        let _tab_guard = self.tab_lock.lock().unwrap();
+        // Serialize access to the single shared browser tab and ensure a
+        // live session exists (lazy init or recreate-after-death).
+        let mut session_guard = self.session.lock().unwrap();
 
         // Check if we already fetched this card (all 3 sub-endpoints) in one
         // browser session.
@@ -339,41 +371,69 @@ impl Store for CardMarket {
 
         // Not in cache — fetch all three endpoints in a single tab so the
         // Cloudflare session (cookies, localStorage, etc.) carries over.
+        // If the browser died while idle, we recreate the session and retry once.
         let slug = title_to_slug(card_name);
-        match self.fetch_all_in_one_tab(&self.tab, card_name, &slug) {
-            Ok(results) => {
-                let sub = match sub_key {
-                    STORE_PREFIX => results.norwegian.clone(),
-                    STORE_PREFIX_INT => results.int_powerseller.clone(),
-                    STORE_PREFIX_INT_PRIVATE => results.int_private.clone(),
-                    _ => anyhow::bail!("Unknown CardMarket sub-store: {}", sub_key),
-                };
-                self.card_cache
-                    .lock()
-                    .unwrap()
-                    .insert(card_name.to_string(), results);
-                Ok(sub)
-            }
-            Err(ref e) if is_cloudflare_error(e) => {
-                record_cloudflare_block();
-                if SEMI_MANUAL.load(Ordering::Relaxed) {
-                    Err(anyhow::Error::new(RescuePending))
-                } else {
-                    Err(anyhow::anyhow!("Cloudflare challenge"))
+
+        for attempt in 0..2 {
+            let tab = match Self::ensure_tab(&mut *session_guard, self.verbose) {
+                Ok(t) => t,
+                Err(e) => {
+                    let msg = e.to_string();
+                    eprintln!("  [{}] Failed to start browser: {}", sub_key, msg);
+                    return Err(anyhow::anyhow!("{msg}"));
                 }
-            }
-            Err(e) => {
-                let detail: String = e
-                    .chain()
-                    .map(|c| c.to_string())
-                    .collect::<Vec<_>>()
-                    .join(": ");
-                if self.verbose {
-                    eprintln!("  [{}] {detail}", sub_key);
+            };
+
+            match self.fetch_all_in_one_tab(&tab, card_name, &slug) {
+                Ok(results) => {
+                    let sub = match sub_key {
+                        STORE_PREFIX => results.norwegian.clone(),
+                        STORE_PREFIX_INT => results.int_powerseller.clone(),
+                        STORE_PREFIX_INT_PRIVATE => results.int_private.clone(),
+                        _ => anyhow::bail!("Unknown CardMarket sub-store: {}", sub_key),
+                    };
+                    self.card_cache
+                        .lock()
+                        .unwrap()
+                        .insert(card_name.to_string(), results);
+                    return Ok(sub);
                 }
-                Err(anyhow::anyhow!("{detail}"))
+                Err(ref e) if is_cloudflare_error(e) => {
+                    record_cloudflare_block();
+                    if SEMI_MANUAL.load(Ordering::Relaxed) {
+                        return Err(anyhow::Error::new(RescuePending));
+                    } else {
+                        return Err(anyhow::anyhow!("Cloudflare challenge"));
+                    }
+                }
+                Err(e) if Self::is_browser_dead(&e) && attempt == 0 => {
+                    // Browser died while idle — discard and recreate.
+                    eprintln!(
+                        "  [{}] CardMarket browser died — recreating session for '{}'",
+                        sub_key, card_name
+                    );
+                    *session_guard = None;
+                    // Clear in-memory card cache too — the new browser
+                    // session won't have Cloudflare cookies from the old one.
+                    self.card_cache.lock().unwrap().clear();
+                    continue;
+                }
+                Err(e) => {
+                    let detail: String = e
+                        .chain()
+                        .map(|c| c.to_string())
+                        .collect::<Vec<_>>()
+                        .join(": ");
+                    if self.verbose {
+                        eprintln!("  [{}] {detail}", sub_key);
+                    }
+                    return Err(anyhow::anyhow!("{detail}"));
+                }
             }
         }
+
+        // Unreachable — the loop always returns or continues at most once.
+        unreachable!()
     }
 }
 

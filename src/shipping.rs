@@ -59,15 +59,14 @@ pub(crate) fn is_blacklisted(name: &str) -> bool {
 // ── Seller name extraction ────────────────────────────────────────────────────
 
 /// Extract the seller name from a store identifier.
-/// For stores with per-seller results like "cardmarket-int.com: MTGSPOT-DE"
-/// or "finn.no: OlaNordmann", returns just the seller name.
-/// For storefronts like "outland.no", returns the full name as-is.
+/// For stores with per-seller results like "cardmarket-int.com: MTGSPOT-DE",
+/// returns just the seller name.
+/// For storefronts like "outland.no" or "finn.no", returns the full name as-is.
 pub(crate) fn extract_seller_name(store_name: &str) -> &str {
     store_name
         .strip_prefix("cardmarket.com: ")
         .or_else(|| store_name.strip_prefix("cardmarket-int.com: "))
         .or_else(|| store_name.strip_prefix("cardmarket-int-private.com: "))
-        .or_else(|| store_name.strip_prefix("finn.no: "))
         .unwrap_or(store_name)
 }
 
