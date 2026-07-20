@@ -72,8 +72,8 @@ struct Cli {
     #[arg(long)]
     semi_manual: bool,
 
-    /// Use exhaustive search (only for <= 12 cards).  Enumerates every
-    /// possible store assignment to guarantee the optimal solution.
+    /// Use exhaustive search: heuristic baseline + store-swap refinement
+    /// to guarantee the optimal store assignment.
     #[arg(long)]
     exhaustive: bool,
 
@@ -91,12 +91,12 @@ fn main() -> anyhow::Result<()> {
 
     // Server mode: start HTTP API and block forever.
     if cli.server {
-        let stores = Arc::new(stores::all_stores(cli.verbose));
         let cache = if cli.no_cache {
             None
         } else {
             Some(Arc::new(Cache::open("cache.db")?))
         };
+        let stores = Arc::new(stores::all_stores(cli.verbose, cache.clone()));
 
         let state = Arc::new(server::AppState::new(stores, cache));
         let app = server::build_router(state);
@@ -245,15 +245,24 @@ fn main() -> anyhow::Result<()> {
             "simplest" => "cheapest",
             _ => strategy_name,
         };
-        let mut prev_history = cache.load_best_solutions(strategy_name, cli.eu_destination)?;
-        let other_history = cache.load_best_solutions(other_strategy, cli.eu_destination)?;
+        let mut prev_history =
+            cache.load_best_solutions(strategy_name, cli.eu_destination, &unique_cards)?;
+        let other_history =
+            cache.load_best_solutions(other_strategy, cli.eu_destination, &unique_cards)?;
+        // Track which tolerances were imported from the other strategy so
+        // we can persist them under the current strategy when they beat
+        // the current run's results.
+        let mut imported_tolerances: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
         for (t, rec) in other_history {
             match prev_history.get(&t) {
                 Some(existing) if rec.total_cost < existing.total_cost => {
                     prev_history.insert(t, rec);
+                    imported_tolerances.insert(t);
                 }
                 None => {
                     prev_history.insert(t, rec);
+                    imported_tolerances.insert(t);
                 }
                 _ => {}
             }
@@ -267,12 +276,10 @@ fn main() -> anyhow::Result<()> {
 
         let mut solutions: Vec<(usize, wizard::WizardSolution)> = Vec::new();
         let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
-        let mut exhaustive_seed_score: Option<u64> = None;
         for t in 0..=cli.tolerance {
             if let Some(ref candidates) = exhaustive_candidates {
                 search_mode = wizard::SearchMode::Exhaustive {
                     candidates: candidates.clone(),
-                    seed_score: exhaustive_seed_score,
                 };
             }
             let config = WizardConfig {
@@ -306,16 +313,6 @@ fn main() -> anyhow::Result<()> {
                     search_mode = wizard::SearchMode::Heuristic {
                         seed: Some(seed_choices),
                     };
-                } else if t < cli.tolerance {
-                    // Seed the next exhaustive tolerance level with the best
-                    // solution from this level, recomputed at t+1.
-                    let next_config = WizardConfig {
-                        strategy: cli.strategy,
-                        tolerance: t + 1,
-                    };
-                    let next_sol =
-                        wizard::solution_from_choices(&best.raw_choices, &input, &next_config);
-                    exhaustive_seed_score = Some(next_sol.score);
                 }
                 for sol in results.into_iter() {
                     solutions.push((t, sol));
@@ -363,6 +360,7 @@ fn main() -> anyhow::Result<()> {
                         cli.exhaustive,
                         *rank,
                         cur_sol,
+                        &unique_cards,
                     )?;
                 }
 
@@ -382,6 +380,20 @@ fn main() -> anyhow::Result<()> {
                         };
                         let reconstructed =
                             wizard::solution_from_choices(&prev.raw_choices, &input, &config);
+                        // When the better solution was imported from the OTHER
+                        // strategy, also persist it under the CURRENT strategy
+                        // so the inferior current result doesn't survive across runs.
+                        if imported_tolerances.contains(t) {
+                            cache.save_wizard_solution(
+                                strategy_name,
+                                *t,
+                                cli.eu_destination,
+                                cli.exhaustive,
+                                1, // rank 1 — this is the best we know
+                                &reconstructed,
+                                &unique_cards,
+                            )?;
+                        }
                         merged.push((*t, reconstructed));
                     }
                 }
@@ -399,7 +411,14 @@ fn main() -> anyhow::Result<()> {
 
     // ── Normal search mode ──────────────────────────────────────────────────
 
-    let mut stores_list = stores::all_stores(cli.verbose);
+    // Open cache (unless --no-cache)
+    let cache: Option<Arc<Cache>> = if cli.no_cache {
+        None
+    } else {
+        Some(Arc::new(Cache::open("cache.db")?))
+    };
+
+    let mut stores_list = stores::all_stores(cli.verbose, cache.clone());
 
     // Filter stores if --stores is provided
     if !cli.stores.is_empty() {
@@ -422,13 +441,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     let num_stores = stores_list.len();
-
-    // Open cache (unless --no-cache)
-    let cache: Option<Arc<Cache>> = if cli.no_cache {
-        None
-    } else {
-        Some(Arc::new(Cache::open("cache.db")?))
-    };
 
     // Resolve card names via Scryfall autocomplete before searching stores.
     let unique_cards = {
@@ -874,11 +886,42 @@ fn main() -> anyhow::Result<()> {
 /// Strip a leading quantity from a line like "1 Snakeskin Veil" → "Snakeskin Veil".
 fn strip_quantity(line: &str) -> String {
     let trimmed = line.trim();
+
+    // "4 Lightning Bolt" — bare number prefix
     if let Some((first, rest)) = trimmed.split_once(char::is_whitespace) {
         if first.parse::<u32>().is_ok() {
-            return rest.trim().to_string();
+            let rest = rest.trim_start();
+            if !rest.starts_with('x') && !rest.starts_with('X') {
+                return rest.trim().to_string();
+            }
         }
     }
+
+    // "4x Lightning Bolt", "4X Lightning Bolt", "4 x Lightning Bolt"
+    let bytes = trimmed.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+    if pos > 0 && pos < bytes.len() {
+        // Skip optional whitespace between number and 'x'
+        while pos < bytes.len() && bytes[pos] == b' ' {
+            pos += 1;
+        }
+        // Skip 'x' or 'X'
+        if pos < bytes.len() && (bytes[pos] == b'x' || bytes[pos] == b'X') {
+            pos += 1;
+            // Skip whitespace after 'x'
+            while pos < bytes.len() && bytes[pos] == b' ' {
+                pos += 1;
+            }
+            let result = trimmed[pos..].trim();
+            if !result.is_empty() {
+                return result.to_string();
+            }
+        }
+    }
+
     trimmed.to_string()
 }
 
@@ -893,5 +936,9 @@ mod tests {
         assert_eq!(strip_quantity("Snakeskin Veil"), "Snakeskin Veil");
         assert_eq!(strip_quantity("  2  Double Space  "), "Double Space");
         assert_eq!(strip_quantity("No Number Here"), "No Number Here");
+        assert_eq!(strip_quantity("4x Lightning Bolt"), "Lightning Bolt");
+        assert_eq!(strip_quantity("4 x Lightning Bolt"), "Lightning Bolt");
+        assert_eq!(strip_quantity("4X Lightning Bolt"), "Lightning Bolt");
+        assert_eq!(strip_quantity("42x Dark Ritual"), "Dark Ritual");
     }
 }

@@ -8,6 +8,7 @@ pub mod outland;
 pub mod pokeboks;
 
 use anyhow::Result;
+use std::sync::Arc;
 
 /// Minimum shared delay between requests across all stores (in milliseconds).
 pub const DELAY_MS: u64 = 300;
@@ -102,7 +103,7 @@ pub trait Store: Send + Sync {
 }
 
 /// Register all store backends here.
-pub fn all_stores(verbose: bool) -> Vec<Box<dyn Store>> {
+pub fn all_stores(verbose: bool, cache: Option<Arc<crate::cache::Cache>>) -> Vec<Box<dyn Store>> {
     vec![
         Box::new(outland::Outland::new()),
         Box::new(finn::Finn::new()),
@@ -111,6 +112,6 @@ pub fn all_stores(verbose: bool) -> Vec<Box<dyn Store>> {
         Box::new(midgard::Midgard::new()),
         Box::new(pokeboks::Pokeboks::new()),
         Box::new(adamstuen::Adamstuen::new()),
-        Box::new(cardmarket::CardMarket::new(verbose)),
+        Box::new(cardmarket::CardMarket::new(verbose, cache)),
     ]
 }

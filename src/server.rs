@@ -38,8 +38,6 @@ pub struct WizardRequest {
     pub eu_destination: bool,
     #[serde(default = "default_strategy")]
     pub strategy: String,
-    #[serde(default)]
-    pub exhaustive: bool,
 }
 
 fn default_strategy() -> String {
@@ -238,9 +236,11 @@ struct Job {
     tolerance_done: usize,
     /// Wizard: total tolerance levels.
     tolerance_total: usize,
-    /// Wizard (exhaustive): total store subsets to evaluate.
+    /// Wizard (exhaustive): total estimated store-swap trials.
     combos_total: u64,
     result: Option<JobResult>,
+    /// Heuristic result available immediately while exhaustive runs.
+    partial_result: Option<JobResult>,
     error: Option<String>,
 }
 
@@ -258,6 +258,9 @@ struct JobResponse {
     combos_total: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<JobResult>,
+    /// Heuristic result populated early, before exhaustive search completes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    partial_result: Option<JobResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
@@ -295,6 +298,7 @@ impl Job {
             combos_done,
             combos_total: self.combos_total,
             result: self.result.clone(),
+            partial_result: self.partial_result.clone(),
             error: self.error.clone(),
         }
     }
@@ -636,6 +640,7 @@ async fn start_fetch(
         tolerance_total: 0,
         combos_total: 0,
         result: None,
+        partial_result: None,
         error: None,
     }));
 
@@ -795,11 +800,10 @@ async fn start_wizard(
         Strategy::Cheapest => "cheapest",
     };
 
-    // Check if we have suitable cached solutions for the exact parameters.
-    // Only skip computation if the cache is exhaustive, or if the current
-    // request is also non-exhaustive (heuristic).
+    // Only use cached solutions if they were computed exhaustively.
+    // Non-exhaustive cache entries are stale and will be replaced.
     let cached = cache
-        .get_cached_solutions(strategy_name, req.tolerance, req.eu_destination)
+        .get_cached_solutions(strategy_name, req.tolerance, req.eu_destination, &cards)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -807,15 +811,9 @@ async fn start_wizard(
             )
         })?;
 
-    // Only use cached solutions if they were computed for the same number
-    // of cards as the current request, otherwise the choices vector will
-    // be silently truncated/padded by solution_from_choices.
-    let card_count_match = cached
-        .first()
-        .is_some_and(|(h, _)| h.raw_choices.len() == cards.len());
-    if !cached.is_empty() && card_count_match {
+    if !cached.is_empty() {
         let can_use_cache =
-            cached.iter().any(|(_, was_exhaustive)| *was_exhaustive) || !req.exhaustive;
+            cached.iter().any(|(_, was_exhaustive)| *was_exhaustive);
         if can_use_cache {
             let input =
                 wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
@@ -834,22 +832,16 @@ async fn start_wizard(
                 "u": unrecognized,
             })));
         }
-        // Cache was non-exhaustive but request is exhaustive — fall through to compute.
     }
 
     let tolerance_total = req.tolerance + 1;
 
-    // Pre-compute exhaustive combo count if needed.
     let input = wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
-    let combos_total = if req.exhaustive {
-        let candidates = wizard::select_candidate_stores(&input);
-        // Estimate store-swap trials: candidates × (add + swap + remove) × iters
-        let n_c = candidates.len() as u64;
-        let stores_guess = 7u64;
-        n_c * (1 + stores_guess + 1) * 5
-    } else {
-        0
-    };
+    let candidates = wizard::select_candidate_stores(&input);
+    // Estimate store-swap trials: candidates × (add + swap + remove) × iters
+    let n_c = candidates.len() as u64;
+    let stores_guess = 7u64;
+    let combos_total = n_c * (1 + stores_guess + 1) * 5;
 
     state
         .reserve_slot(JobKind::Wizard)
@@ -878,6 +870,7 @@ async fn start_wizard(
         tolerance_total,
         combos_total,
         result: None,
+        partial_result: None,
         error: None,
     }));
 
@@ -889,7 +882,6 @@ async fn start_wizard(
 
     let job_ref = job.clone();
     let cache_clone = cache.clone();
-    let exhaustive = req.exhaustive;
     let tolerance = req.tolerance;
     let eu = req.eu_destination;
     let unrecognized_for_job = unrecognized.clone();
@@ -900,26 +892,11 @@ async fn start_wizard(
             j.status = "running".into();
         }
 
-        let exhaustive_candidates = if exhaustive {
-            let c = wizard::select_candidate_stores(&input);
-            crate::wizard::SWAP_TRIAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-            Some(c)
-        } else {
-            None
-        };
-
+        // ═══ Phase 1: Heuristic (fast) — return partial result immediately ═══
         let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
-        let mut solutions: Vec<(usize, WizardSolution)> = Vec::new();
-        let mut exhaustive_seed_score: Option<u64> = None;
+        let mut heuristic_solutions: Vec<(usize, WizardSolution)> = Vec::new();
 
         for t in 0..=tolerance {
-            if let Some(ref candidates) = exhaustive_candidates {
-                crate::wizard::SWAP_TRIAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-                search_mode = wizard::SearchMode::Exhaustive {
-                    candidates: candidates.clone(),
-                    seed_score: exhaustive_seed_score,
-                };
-            }
             let config = WizardConfig {
                 strategy,
                 tolerance: t,
@@ -927,24 +904,11 @@ async fn start_wizard(
             let results = wizard::optimize_input(&input, &config, &search_mode);
             if !results.is_empty() {
                 let best = &results[0];
-                if exhaustive_candidates.is_none() {
-                    search_mode = wizard::SearchMode::Heuristic {
-                        seed: Some(best.raw_choices.clone()),
-                    };
-                } else if t < tolerance {
-                    // Seed the next tolerance level with the best solution from
-                    // this level, recomputed at the next tolerance so the score
-                    // is comparable.  Tightens the rejection bound early.
-                    let next_config = WizardConfig {
-                        strategy,
-                        tolerance: t + 1,
-                    };
-                    let next_sol =
-                        wizard::solution_from_choices(&best.raw_choices, &input, &next_config);
-                    exhaustive_seed_score = Some(next_sol.score);
-                }
+                search_mode = wizard::SearchMode::Heuristic {
+                    seed: Some(best.raw_choices.clone()),
+                };
                 for sol in results {
-                    solutions.push((t, sol));
+                    heuristic_solutions.push((t, sol));
                 }
             }
 
@@ -954,25 +918,91 @@ async fn start_wizard(
             }
         }
 
+        // Emit heuristic result so the client can show something immediately.
+        {
+            let max_tol_heuristic: Vec<WizardSolution> = heuristic_solutions
+                .iter()
+                .filter(|(t, _)| *t == tolerance)
+                .map(|(_, s)| s.clone())
+                .collect();
+            let mut j = job_ref.lock().unwrap();
+            if !max_tol_heuristic.is_empty() {
+                j.partial_result = Some(JobResult::Wizard(WizardResultData {
+                    results: WizardResponseData::from_solutions(&max_tol_heuristic),
+                    unrecognized: unrecognized_for_job.clone(),
+                }));
+            }
+        }
+
+        // ═══ Phase 2: Exhaustive (store-swap refinement) ═══
+        crate::wizard::SWAP_TRIAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Reset progress counter for phase 2.
+        {
+            let mut j = job_ref.lock().unwrap();
+            j.tolerance_done = 0;
+        }
+
+        let mut all_solutions: Vec<(usize, WizardSolution)> = Vec::new();
+
+        for t in 0..=tolerance {
+            crate::wizard::SWAP_TRIAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+            let config = WizardConfig {
+                strategy,
+                tolerance: t,
+            };
+            let mode = wizard::SearchMode::Exhaustive {
+                candidates: candidates.clone(),
+            };
+            let results = wizard::optimize_input(&input, &config, &mode);
+            if !results.is_empty() {
+                for sol in results {
+                    all_solutions.push((t, sol));
+                }
+            }
+
+            {
+                let mut j = job_ref.lock().unwrap();
+                j.tolerance_done = t + 1;
+            }
+        }
+
+        // ── Finalise ─────────────────────────────────────────────────────
         let mut j = job_ref.lock().unwrap();
 
-        if solutions.is_empty() {
+        if all_solutions.is_empty() {
+            // Heuristic found something but exhaustive didn't — keep the
+            // partial result as final and mark done.
+            if j.partial_result.is_some() {
+                j.status = "done".into();
+                j.tolerance_done = tolerance_total;
+                j.result = j.partial_result.clone();
+                return;
+            }
             j.status = "failed".into();
             j.error = Some("No valid solutions found.".into());
             return;
         }
 
-        // Save all solutions to cache with rank.
+        // Save all exhaustive solutions to cache with rank.
         let mut tol_counter: std::collections::HashMap<usize, usize> =
             std::collections::HashMap::new();
-        for (t, sol) in &solutions {
+        for (t, sol) in &all_solutions {
             let rank = tol_counter.entry(*t).or_insert(0);
             *rank += 1;
-            let _ = cache_clone.save_wizard_solution(strategy_name, *t, eu, exhaustive, *rank, sol);
+            let _ = cache_clone.save_wizard_solution(
+                strategy_name,
+                *t,
+                eu,
+                true, // always exhaustive now
+                *rank,
+                sol,
+                &cards,
+            );
         }
 
         // Return all solutions for the max tolerance, best first.
-        let max_tol_solutions: Vec<WizardSolution> = solutions
+        let max_tol_solutions: Vec<WizardSolution> = all_solutions
             .iter()
             .filter(|(t, _)| *t == tolerance)
             .map(|(_, s)| s.clone())

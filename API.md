@@ -134,15 +134,20 @@ Finds the optimal store assignments from previously fetched (cached) card listin
 Like `/fetch`, card names are resolved via Scryfall before lookup.
 
 Returns a response with `r` (array of up to **3 solutions**, sorted best-first)
-and `u` (names that couldn't be resolved). Exhaustive mode always returns
-up to 3 alternatives (different store combinations with similar cost); heuristic mode
-returns 1.
+and `u` (names that couldn't be resolved).
 
-If a suitable previously-computed solution is cached, it is returned immediately without
-creating a background job. A cached solution is "suitable" if it was computed
-exhaustively, or if the current request is also non-exhaustive (heuristic).
-A non-exhaustive cached solution triggers a fresh computation only when the
-current request is exhaustive.
+If a suitably cached solution exists (computed exhaustively), it is returned
+immediately without creating a background job.
+
+**Two-phase computation:** When a background job is created, the wizard runs in two
+phases for the best user experience:
+1. **Heuristic phase** — fast, returns a good solution. Populated as `partial_result`
+   in the job response, available within seconds.
+2. **Exhaustive phase** — store-swap refinement that may improve upon the heuristic
+   result. Updates `result` when complete.
+
+The frontend should display `partial_result` as soon as it appears and swap to
+`result` when it arrives.
 
 **Prerequisite:** Run `/fetch` first for the same cards so listings are in the cache.
 
@@ -152,8 +157,7 @@ current request is exhaustive.
   "cards": ["Lightning Bolt", "Counterspell"],
   "tolerance": 2,
   "eu_destination": false,
-  "strategy": "cheapest",
-  "exhaustive": false
+  "strategy": "cheapest"
 }
 ```
 
@@ -163,7 +167,6 @@ current request is exhaustive.
 | `tolerance` | `number` | `0` | Max cards the solution may skip. **Max 5.** |
 | `eu_destination` | `boolean` | `false` | Removes 25% VAT from non-Norwegian sellers. |
 | `strategy` | `string` | `"cheapest"` | `"cheapest"` or `"simplest"` |
-| `exhaustive` | `boolean` | `false` | Guaranteed optimal, but only works for ≤12 cards. Slow. |
 
 **Response (cached solution hit — no job):**
 ```json
@@ -187,9 +190,8 @@ current request is exhaustive.
 }
 ```
 
-The `r` array contains up to **3 solutions**, sorted best-first (lowest internal score).
-Exhaustive mode always returns up to 3 alternatives; heuristic mode returns 1.
-Each solution object has the same shape:
+The `r` array contains up to **3 solutions**, sorted best-first (lowest internal
+score). Each solution object has the same shape:
 
 | Field | Type | Notes |
 |---|---|---|
@@ -262,7 +264,7 @@ frontend knows which progress fields to display.
 }
 ```
 
-**Response when running (wizard job, heuristic):**
+**Response when running (wizard — heuristic phase):**
 ```json
 {
   "status": "running",
@@ -274,11 +276,11 @@ frontend knows which progress fields to display.
   "tolerance_done": 1,
   "tolerance_total": 3,
   "combos_done": 0,
-  "combos_total": 0
+  "combos_total": 9000
 }
 ```
 
-**Response when running (wizard job, exhaustive):**
+**Response when running (wizard — after heuristic, exhaustive in progress):**
 ```json
 {
   "status": "running",
@@ -289,10 +291,29 @@ frontend knows which progress fields to display.
   "current_card": "",
   "tolerance_done": 1,
   "tolerance_total": 3,
-  "combos_done": 523,
-  "combos_total": 2048
+  "combos_done": 1847,
+  "combos_total": 9000,
+  "partial_result": {
+    "r": [
+      {
+        "a": [
+          {"c": "Lightning Bolt", "s": "outland.no", "p": 200, "u": "https://…"},
+          {"c": "Counterspell"}
+        ],
+        "sk": ["Counterspell"],
+        "st": [{"n": "outland.no", "ct": 200, "sh": 2900}],
+        "tc": 200,
+        "ts": 2900,
+        "ns": 1
+      }
+    ],
+    "u": []
+  }
 }
 ```
+`partial_result` is populated as soon as the heuristic phase completes, so the
+frontend can display a good solution without waiting for the exhaustive pass.
+`tolerance_done` resets to 0 at the start of phase 2 and counts up again.
 
 **Field reference:**
 
@@ -304,10 +325,11 @@ frontend knows which progress fields to display.
 | `cards_total` | fetch | Total card×store pairs. Progress% = done/total×100 |
 | `current_store` | fetch | Store currently being queried (e.g. `"outland.no"`) |
 | `current_card` | fetch | Card currently being searched |
-| `tolerance_done` | wizard | Tolerance levels completed so far |
+| `tolerance_done` | wizard | Tolerance levels completed in current phase |
 | `tolerance_total` | wizard | Total tolerance levels to try |
-| `combos_done` | wizard | Store combinations evaluated (exhaustive only) |
-| `combos_total` | wizard | Total store combinations to evaluate (exhaustive only; 0 for heuristic) |
+| `combos_done` | wizard | Store-swap trials attempted so far (phase 2) |
+| `combos_total` | wizard | Estimated total store-swap trials (always populated for wizard) |
+| `partial_result` | wizard | Heuristic result, available early while exhaustive runs in background |
 | `result` | both | Final result object (only when `"done"`) — matches the `/fetch` or `/wizard` response format |
 | `error` | both | Error message (only when `"failed"`) |
 
@@ -350,8 +372,8 @@ frontend knows which progress fields to display.
   "current_card": "",
   "tolerance_done": 3,
   "tolerance_total": 3,
-  "combos_done": 2048,
-  "combos_total": 2048,
+  "combos_done": 9000,
+  "combos_total": 9000,
   "result": {
     "r": [
       {
@@ -374,7 +396,6 @@ frontend knows which progress fields to display.
 ```
 
 The `result.r` array contains up to **3 solutions**, sorted best-first.
-Exhaustive mode always returns up to 3 alternatives; heuristic mode returns 1.
 
 **Failed response:**
 ```json

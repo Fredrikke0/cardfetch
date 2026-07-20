@@ -142,6 +142,10 @@ pub struct CardMarket {
     /// or it died and needs to be recreated.
     session: Mutex<Option<BrowserSession>>,
     card_cache: Mutex<std::collections::HashMap<String, CardResults>>,
+    /// Optional persistent SQLite cache — when set, CardMarket persists
+    /// results for ALL three sub-endpoints (not just the requested one)
+    /// so subsequent runs hit the cache for every sub-key.
+    persistent_cache: Option<Arc<crate::cache::Cache>>,
     verbose: bool,
 }
 
@@ -153,13 +157,14 @@ struct CardResults {
 }
 
 impl CardMarket {
-    pub fn new(verbose: bool) -> Self {
+    pub fn new(verbose: bool, persistent_cache: Option<Arc<crate::cache::Cache>>) -> Self {
         CardMarket {
             // Browser is created lazily on the first fetch request.
             // This avoids keeping a Chrome process alive indefinitely
             // in long-running server mode.
             session: Mutex::new(None),
             card_cache: Mutex::new(std::collections::HashMap::new()),
+            persistent_cache,
             verbose,
         }
     }
@@ -391,6 +396,10 @@ impl Store for CardMarket {
                         STORE_PREFIX_INT_PRIVATE => results.int_private.clone(),
                         _ => anyhow::bail!("Unknown CardMarket sub-store: {}", sub_key),
                     };
+                    // Persist ALL sub-endpoints to the SQLite cache so that
+                    // the next run hits the cache for every cache key, not
+                    // just the one that happened to miss this time.
+                    self.persist_all_sub_results(card_name, &results);
                     self.card_cache
                         .lock()
                         .unwrap()
@@ -439,6 +448,38 @@ impl Store for CardMarket {
 // ── Fetch methods ──────────────────────────────────────────────────────────
 
 impl CardMarket {
+    /// Persist all three sub-endpoints' results to the SQLite cache.
+    /// Results are grouped by seller store-name so that `cache.store()`
+    /// receives each seller's entries as a single batch (DELETE + INSERT).
+    fn persist_all_sub_results(&self, card_name: &str, results: &CardResults) {
+        let cache = match self.persistent_cache.as_ref() {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Group entries by store_name so each seller's rows are
+        // replaced atomically (cache.store DELETEs the old rows first).
+        let mut by_seller: std::collections::HashMap<String, Vec<StoreResult>> =
+            std::collections::HashMap::new();
+
+        for result in results
+            .norwegian
+            .iter()
+            .chain(results.int_powerseller.iter())
+            .chain(results.int_private.iter())
+        {
+            by_seller
+                .entry(result.store_name.clone())
+                .or_default()
+                .push(result.clone());
+        }
+
+        for (store_name, grouped) in &by_seller {
+            // Best-effort — don't let a cache write failure kill the search.
+            let _ = cache.store(card_name, store_name, Some(grouped.as_slice()));
+        }
+    }
+
     /// Fetch all three CardMarket sub-endpoints for `card_name` using the
     /// given browser tab.  The tab is reused across cards to avoid leaking
     /// tabs in the browser process.

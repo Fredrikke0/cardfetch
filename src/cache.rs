@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours
+const NEGATIVE_TTL: Duration = Duration::from_secs(3 * 24 * 3600); // 3 days
 const POSITIVE_TTL: Duration = Duration::from_secs(7 * 24 * 3600); // 7 days
 const SCRYFALL_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours (per Scryfall recommendation)
 
@@ -184,6 +184,20 @@ impl Cache {
                         ON wizard_solutions(strategy, tolerance);",
                 )
                 .context("Failed to migrate wizard_solutions unique constraint")?;
+            }
+        }
+
+        // Migration: add card_names column so we can skip cached
+        // solutions whose card list doesn't match the current run.
+        {
+            let has_col: bool = conn
+                .prepare("SELECT card_names FROM wizard_solutions LIMIT 0")
+                .is_ok();
+            if !has_col {
+                conn.execute_batch(
+                    "ALTER TABLE wizard_solutions ADD COLUMN card_names TEXT NOT NULL DEFAULT '';",
+                )
+                .context("Failed to migrate wizard_solutions card_names")?;
             }
         }
 
@@ -470,6 +484,7 @@ impl Cache {
         was_exhaustive: bool,
         rank: usize,
         solution: &WizardSolution,
+        card_names: &[String],
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = epoch_secs();
@@ -481,14 +496,15 @@ impl Cache {
             0
         };
         let assignments_json = serde_json::to_string(&solution.raw_choices)?;
+        let card_names_str = card_names.join("\n");
 
         conn.execute(
             "INSERT OR REPLACE INTO wizard_solutions
                 (strategy, tolerance, eu_destination, was_exhaustive, rank,
                  num_stores, num_found, num_skipped,
                  total_card_cost, total_shipping, total_cost, per_card_cost,
-                 assignments_json, created_at, is_current)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1)",
+                 assignments_json, card_names, created_at, is_current)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)",
             rusqlite::params![
                 strategy,
                 tolerance as i64,
@@ -503,6 +519,7 @@ impl Cache {
                 total_cost as i64,
                 per_card as i64,
                 assignments_json,
+                card_names_str,
                 now,
             ],
         )?;
@@ -583,34 +600,42 @@ impl Cache {
 
     /// Load the best-ever solution (lowest total_cost) for each tolerance
     /// of the given strategy and EU destination.  Returns a map: tolerance → record.
+    /// Only solutions whose card list exactly matches `card_names` are returned.
     pub fn load_best_solutions(
         &self,
         strategy: &str,
         eu_destination: bool,
+        card_names: &[String],
     ) -> anyhow::Result<HashMap<usize, WizardHistory>> {
         let conn = self.conn.lock().unwrap();
+        let card_names_str = card_names.join("\n");
         let mut stmt = conn.prepare(
             "SELECT tolerance, num_stores, num_skipped,
                     total_cost, assignments_json
              FROM wizard_solutions
-             WHERE strategy = ?1 AND eu_destination = ?2
+             WHERE strategy = ?1
+               AND eu_destination = ?2
+               AND card_names = ?3
              ORDER BY total_cost ASC",
         )?;
 
         let mut map = HashMap::new();
         let rows: Vec<WizardHistory> = stmt
-            .query_map(rusqlite::params![strategy, eu_destination as i64], |row| {
-                let json_str: String = row.get(4)?;
-                let raw_choices: Vec<Option<usize>> =
-                    serde_json::from_str(&json_str).unwrap_or_default();
-                Ok(WizardHistory {
-                    tolerance: row.get::<_, i64>(0)? as usize,
-                    num_stores: row.get::<_, i64>(1)? as usize,
-                    num_skipped: row.get::<_, i64>(2)? as usize,
-                    total_cost: row.get::<_, i64>(3)? as u64,
-                    raw_choices,
-                })
-            })?
+            .query_map(
+                rusqlite::params![strategy, eu_destination as i64, card_names_str],
+                |row| {
+                    let json_str: String = row.get(4)?;
+                    let raw_choices: Vec<Option<usize>> =
+                        serde_json::from_str(&json_str).unwrap_or_default();
+                    Ok(WizardHistory {
+                        tolerance: row.get::<_, i64>(0)? as usize,
+                        num_stores: row.get::<_, i64>(1)? as usize,
+                        num_skipped: row.get::<_, i64>(2)? as usize,
+                        total_cost: row.get::<_, i64>(3)? as u64,
+                        raw_choices,
+                    })
+                },
+            )?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -625,24 +650,33 @@ impl Cache {
     /// Look up all cached wizard solutions for the exact parameters.
     /// Returns up to TOP_N solutions (ordered by rank, best first) and
     /// whether they were computed exhaustively.
+    /// Only solutions whose card list exactly matches `card_names` are returned.
     pub fn get_cached_solutions(
         &self,
         strategy: &str,
         tolerance: usize,
         eu_destination: bool,
+        card_names: &[String],
     ) -> anyhow::Result<Vec<(WizardHistory, bool)>> {
         let conn = self.conn.lock().unwrap();
+        let card_names_str = card_names.join("\n");
         let mut stmt = conn.prepare(
             "SELECT tolerance, num_stores, num_skipped,
                     total_cost, assignments_json, was_exhaustive
              FROM wizard_solutions
              WHERE strategy = ?1 AND tolerance = ?2 AND eu_destination = ?3
+               AND card_names = ?4
              ORDER BY total_cost ASC",
         )?;
 
         let rows: Vec<(WizardHistory, bool)> = stmt
             .query_map(
-                rusqlite::params![strategy, tolerance as i64, eu_destination as i64],
+                rusqlite::params![
+                    strategy,
+                    tolerance as i64,
+                    eu_destination as i64,
+                    card_names_str
+                ],
                 |row| {
                     let json_str: String = row.get(4)?;
                     let raw_choices: Vec<Option<usize>> =
@@ -672,9 +706,13 @@ impl Cache {
         let conn = self.conn.lock().unwrap();
         let now = epoch_secs();
 
+        // Normalise to lowercase so that "Dark Ritual", "dark ritual", etc.
+        // share a single Scryfall cache entry and avoid listing-table fragmentation.
+        let key = input_name.to_lowercase();
+
         let row = conn.query_row(
             "SELECT resolved_name, fetched_at FROM scryfall_names WHERE input_name = ?1",
-            rusqlite::params![input_name],
+            rusqlite::params![key],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         );
         let row = optional(row)?;
@@ -697,10 +735,13 @@ impl Cache {
         let conn = self.conn.lock().unwrap();
         let now = epoch_secs();
 
+        // Normalise to lowercase to match lookup_scryfall.
+        let key = input_name.to_lowercase();
+
         conn.execute(
             "INSERT OR REPLACE INTO scryfall_names (input_name, resolved_name, fetched_at)
              VALUES (?1, ?2, ?3)",
-            rusqlite::params![input_name, resolved_name, now],
+            rusqlite::params![key, resolved_name, now],
         )?;
 
         Ok(())

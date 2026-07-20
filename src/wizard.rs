@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 
 /// Incremented by `try_store_set` during the store-swap refinement phase.
-/// Server mode reads this when `combos_total` is 0 (new exhaustive mode).
+/// Server mode reads this to report exhaustive wizard progress.
 pub(crate) static SWAP_TRIAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -822,8 +822,7 @@ pub struct WizardSolution {
 
 /// Canonical scoring function: computes the composite score from pre-aggregated
 /// totals.  Every score path in the module (compute_score_static,
-/// score_store_subset) funnels through this one function to guarantee
-/// consistency across the exhaustive and heuristic optimizers.
+/// build_solution) funnels through this one function to guarantee consistency.
 #[inline]
 pub(crate) fn compute_raw_score(
     total_cost: u64,
@@ -850,17 +849,9 @@ pub(crate) enum SearchMode {
     /// Optionally seeded from a previous tolerance level's solution for monotonic
     /// cost guarantees.
     Heuristic { seed: Option<Vec<Option<usize>>> },
-    /// Enumerate store combinations from a pruned candidate pool and greedily
-    /// assign cards within each combination.  Candidates are pre-computed by
-    /// `select_candidate_stores` and reused across tolerance levels.
-    ///
-    /// `seed_score` is the best known score from a *lower* tolerance level
-    /// (recomputed at this tolerance).  It initialises the rejection bound so
-    /// combos that can't beat the previous level's solution are skipped early.
-    Exhaustive {
-        candidates: Vec<usize>,
-        seed_score: Option<u64>,
-    },
+    /// Heuristic baseline + store-swap refinement.  Candidates are pre-computed
+    /// by `select_candidate_stores` and reused across tolerance levels.
+    Exhaustive { candidates: Vec<usize> },
 }
 
 // ── Candidate store selection ──────────────────────────────────────────────────
@@ -1108,16 +1099,18 @@ pub(crate) fn solution_from_choices(
 
 /// Run the optimizer on a pre-built input.
 ///
-/// **Exhaustive mode**: enumerates all k-combinations of candidate stores
-/// for k=1..5, greedily assigning each card to the cheapest store in the
-/// subset.  Note that the card assignment within each combination is greedy
-/// (not globally optimal), so the result is a lower bound on the true
-/// optimum rather than a proof of optimality.
+/// **Exhaustive mode**: runs the heuristic (multi-start + ILS + SA) to
+/// establish a baseline, then iteratively refines the store set via
+/// add/swap/remove operations — for each trial set, does greedy card
+/// assignment followed by hill-climbing.  Converges when no store-set
+/// change improves the score.
 ///
 /// **Heuristic mode**:
-/// **Phase 1 — Multi-start hill climbing**: 50 random restarts.
-/// **Phase 2 — Iterated Local Search + Simulated Annealing**: up to 12
-/// iterations, stopping after 3 consecutive non-improvements.
+/// **Phase 1 — Multi-start hill climbing**: 50-800 random restarts scaled
+/// by tolerance.
+/// **Phase 2 — Iterated Local Search + Simulated Annealing**: 8-100
+/// iterations scaled by tolerance, stopping after 3 consecutive
+/// non-improvements.
 ///
 /// Simplest strategy also uses store-consolidation perturbations.
 pub(crate) fn optimize_input(
@@ -1126,12 +1119,8 @@ pub(crate) fn optimize_input(
     mode: &SearchMode,
 ) -> Vec<WizardSolution> {
     // ── Exhaustive path ──────────────────────────────────────────────────
-    if let SearchMode::Exhaustive {
-        candidates,
-        seed_score,
-    } = mode
-    {
-        if let Some(solutions) = optimize_exhaustive(input, config, candidates, *seed_score) {
+    if let SearchMode::Exhaustive { candidates } = mode {
+        if let Some(solutions) = optimize_exhaustive(input, config, candidates) {
             return solutions;
         }
     }
@@ -1142,22 +1131,23 @@ pub(crate) fn optimize_input(
         SearchMode::Exhaustive { .. } => None,
     };
 
-    let best = run_heuristic(input, config, seed);
-    best.map(|a| build_solution(&a, input))
-        .into_iter()
+    let best = run_heuristic(input, config, seed, 3);
+    best.into_iter()
+        .map(|a| build_solution(&a, input))
         .collect()
 }
 
 /// Run the heuristic optimizer: multi-start hill climbing + iterated local
-/// search with simulated annealing.  Returns the single best assignment found.
+/// search with simulated annealing.  Returns the best assignments found (up
+/// to `max_count` distinct solutions).
 fn run_heuristic(
     input: &WizardInput,
     config: &WizardConfig,
     seed: Option<&[Option<usize>]>,
-) -> Option<ScoredAssignment> {
+    max_count: usize,
+) -> Vec<ScoredAssignment> {
+    let mut top = TopSolutions::new(max_count);
     let mut rng = rand::thread_rng();
-    let mut best: Option<ScoredAssignment> = None;
-    let mut best_score: Option<u64> = None;
 
     // If seeded from a previous tolerance, use it as a candidate.
     // This guarantees the cost can only go down (or stay equal) as
@@ -1167,31 +1157,27 @@ fn run_heuristic(
             choices: choices.to_vec(),
         };
         let current = hill_climb(ScoredAssignment::new(raw, input, config), input, config);
-        best_score = Some(current.score);
-        best = Some(current);
+        top.insert(current);
     }
 
     // ── Phase 1: Multi-start hill climbing (parallel) ────────────────────
     // Front-load effort on unseeded tolerances.  Higher tolerances are
     // seeded from the previous level's solution and need less exploration.
     let num_restarts = (800 / (config.tolerance + 1)).max(50);
-    let parallel_best = (0..num_restarts)
+    let parallel_results: Vec<ScoredAssignment> = (0..num_restarts)
         .into_par_iter()
         .map(|seed_idx| {
             let raw = initial_assignment(input, seed_idx);
             hill_climb(ScoredAssignment::new(raw, input, config), input, config)
         })
-        .min_by_key(|c| c.score);
+        .collect();
 
-    if let Some(par_best) = parallel_best {
-        if best_score.is_none_or(|s| par_best.score < s) {
-            best_score = Some(par_best.score);
-            best = Some(par_best);
-        }
+    for sa in parallel_results {
+        top.insert(sa);
     }
 
     // ── Phase 2: Iterated Local Search ──────────────────────────────────
-    let mut current_best = best.clone().expect("phase 1 always produces a solution");
+    let mut current_best = top.best().clone();
     // Taper ILS effort: tolerance 0 gets full exploration, higher
     // tolerances are seeded and need fewer perturbation cycles.
     let ils_iterations: u32 = (100 / (config.tolerance as u32 + 1)).max(8);
@@ -1205,6 +1191,7 @@ fn run_heuristic(
         1 => 0.40,
         _ => 0.30,
     };
+    let mut best_score = current_best.score;
     let mut no_improve = 0u32;
 
     for i in 0..ils_iterations {
@@ -1254,10 +1241,11 @@ fn run_heuristic(
         // Hill-climb again from wherever SA ended up.
         let final_candidate = hill_climb(sa_candidate, input, config);
 
+        top.insert(final_candidate.clone());
+
         // Keep if improved.
-        if final_candidate.score < best_score.unwrap() {
-            best_score = Some(final_candidate.score);
-            best = Some(final_candidate.clone());
+        if final_candidate.score < best_score {
+            best_score = final_candidate.score;
             current_best = final_candidate;
             no_improve = 0;
         } else {
@@ -1265,7 +1253,48 @@ fn run_heuristic(
         }
     }
 
-    best
+    top.into_vec()
+}
+
+/// Tracks the best N distinct scored assignments, sorted by score ascending.
+struct TopSolutions {
+    entries: Vec<ScoredAssignment>,
+    max_count: usize,
+}
+
+impl TopSolutions {
+    fn new(max_count: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(max_count),
+            max_count,
+        }
+    }
+
+    /// Insert a scored assignment, keeping only the best `max_count` distinct
+    /// entries (deduplicated by `raw_choices`).
+    fn insert(&mut self, sa: ScoredAssignment) {
+        if self.entries.iter().any(|e| e.choices == sa.choices) {
+            return;
+        }
+        let pos = self.entries.partition_point(|e| e.score < sa.score);
+        if pos < self.max_count {
+            self.entries.insert(pos, sa);
+            self.entries.truncate(self.max_count);
+        }
+    }
+
+    /// The single best assignment (panics if empty).
+    fn best(&self) -> &ScoredAssignment {
+        &self.entries[0]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn into_vec(self) -> Vec<ScoredAssignment> {
+        self.entries
+    }
 }
 
 /// Greedily assign each card to the cheapest store in `store_set` that
@@ -1322,13 +1351,16 @@ fn try_store_set(
 /// Explore alternative store combinations by trying add/swap/remove
 /// operations on the store set.  For each trial set, does greedy assignment
 /// followed by hill-climbing.  Continues until no improvement is found.
+/// Populates `top` with the best solutions discovered during the search.
 fn store_swap_search(
     input: &WizardInput,
     config: &WizardConfig,
     candidates: &[usize],
     initial: &ScoredAssignment,
-) -> ScoredAssignment {
+    top: &mut TopSolutions,
+) {
     let mut best = initial.clone();
+    top.insert(best.clone());
 
     loop {
         let old_score = best.score;
@@ -1341,6 +1373,7 @@ fn store_swap_search(
                 continue;
             }
             let trial = try_store_set(input, config, &current_stores, Some(new_si), None);
+            top.insert(trial.clone());
             if trial.score < old_score && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
             {
                 best_trial = Some(trial);
@@ -1354,6 +1387,7 @@ fn store_swap_search(
                     continue;
                 }
                 let trial = try_store_set(input, config, &current_stores, Some(new_si), Some(idx));
+                top.insert(trial.clone());
                 if trial.score < old_score
                     && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
                 {
@@ -1366,6 +1400,7 @@ fn store_swap_search(
         if current_stores.len() > 1 {
             for (idx, _) in current_stores.iter().enumerate() {
                 let trial = try_store_set(input, config, &current_stores, None, Some(idx));
+                top.insert(trial.clone());
                 if trial.score < old_score
                     && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
                 {
@@ -1379,21 +1414,19 @@ fn store_swap_search(
             None => break,
         }
     }
-
-    best
 }
 
 /// Exhaustively search for the optimal store assignment.
 ///
-/// Phase 1: multi-start hill climbing + ILS + SA (same as heuristic mode).
+/// Phase 1: heuristic (multi-start + ILS + SA) for a baseline and top
+/// alternatives.
 /// Phase 2: store-swap local search that tries add/swap/remove operations
-/// on the store set, with greedy re-assignment + hill-climbing for each
-/// trial set.  Continues until convergence.
+/// on the store set, collecting more alternatives.
+/// Returns up to 3 distinct solutions, best first.
 fn optimize_exhaustive(
     input: &WizardInput,
     config: &WizardConfig,
     candidates: &[usize],
-    _seed_score: Option<u64>,
 ) -> Option<Vec<WizardSolution>> {
     let n = input.card_count();
     let n_stores = input.store_names.len();
@@ -1405,30 +1438,47 @@ fn optimize_exhaustive(
         candidates.len(),
     );
 
-    // Phase 1: heuristic baseline.
-    let baseline = run_heuristic(input, config, None)?;
+    let mut top = TopSolutions::new(3);
+
+    // Phase 1: heuristic baseline + alternatives.
+    for sa in run_heuristic(input, config, None, 3) {
+        top.insert(sa);
+    }
+    let baseline_stores = used_store_indices(top.best()).len();
     eprintln!(
         "  [exhaustive] phase 1 (heuristic): {} stores, score {}",
-        used_store_indices(&baseline).len(),
-        baseline.score,
+        baseline_stores,
+        top.best().score,
     );
 
-    // Phase 2: store-swap refinement.
-    let refined = store_swap_search(input, config, candidates, &baseline);
-    let refined_stores = used_store_indices(&refined).len();
-    if refined.score < baseline.score {
+    // Phase 2: store-swap refinement, collecting more alternatives.
+    let before_score = top.best().score;
+    let initial_for_swap = top.best().clone();
+    store_swap_search(input, config, candidates, &initial_for_swap, &mut top);
+    let after_stores = used_store_indices(top.best()).len();
+    if top.best().score < before_score {
         eprintln!(
             "  [exhaustive] phase 2 (store-swap): improved to {} stores, score {}",
-            refined_stores, refined.score,
+            after_stores,
+            top.best().score,
         );
     } else {
         eprintln!(
             "  [exhaustive] phase 2 (store-swap): no improvement, keeping {} stores",
-            refined_stores,
+            after_stores,
         );
     }
 
-    Some(vec![build_solution(&refined, input)])
+    if top.is_empty() {
+        None
+    } else {
+        Some(
+            top.into_vec()
+                .into_iter()
+                .map(|a| build_solution(&a, input))
+                .collect(),
+        )
+    }
 }
 
 // ── Initial assignment builders ──────────────────────────────────────────────
