@@ -82,14 +82,18 @@ pub fn resolve_batch(
 /// Resolve card names via Scryfall with local SQLite caching.
 ///
 /// Checks `cache.lookup_scryfall()` first, falls back to live API calls,
-/// and stores fresh results.  Unrecognized names are skipped with a warning.
-/// Returns the deduplicated list of canonical card names.
+/// and stores fresh results.
+///
+/// Returns `(resolved, unrecognized)`:
+/// - `resolved`: deduplicated list of canonical card names
+/// - `unrecognized`: input names that Scryfall could not resolve
 pub fn resolve_with_cache(
     client: &reqwest::blocking::Client,
     names: &[String],
     cache: &Option<&crate::cache::Cache>,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let mut resolved: Vec<String> = Vec::new();
+    let mut unrecognized: Vec<String> = Vec::new();
 
     for name in names {
         // Check local cache first
@@ -105,10 +109,7 @@ pub fn resolve_with_cache(
                     Some(canonical)
                 }
                 Ok(None) => {
-                    eprintln!(
-                        "Warning: '{}' is not a recognized Magic card -- skipping.",
-                        name
-                    );
+                    unrecognized.push(name.clone());
                     None
                 }
                 Err(e) => {
@@ -136,7 +137,7 @@ pub fn resolve_with_cache(
         "No recognized Magic card names found after resolution."
     );
 
-    Ok(resolved)
+    Ok((resolved, unrecognized))
 }
 
 /// Simple URL-encode for query parameters.

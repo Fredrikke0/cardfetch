@@ -34,7 +34,12 @@ Returns the list of available store names.
 
 ### `POST /fetch`
 
-Submits a card search. Behavior depends on `cache_only`:
+Submits a card search. Card names are resolved to canonical names via the
+[Scryfall autocomplete API](https://scryfall.com/docs/api/cards/autocomplete)
+before searching stores (e.g. `"Lightning"` → `"Lightning Bolt"`).
+Names that cannot be resolved are returned in the `unrecognized` field.
+
+Behavior depends on `cache_only`:
 
 - **`cache_only: false`** (default): If all requested cards are already cached,
   returns results immediately. Otherwise creates a background job.
@@ -64,7 +69,8 @@ Submits a card search. Behavior depends on `cache_only`:
     "Lightning Bolt": [
       { "store": "outland.no", "price": 200, "url": "https://…" }
     ]
-  }
+  },
+  "unrecognized": []
 }
 ```
 
@@ -81,6 +87,7 @@ Submits a card search. Behavior depends on `cache_only`:
 |---|---|---|
 | 400 | `"Too many cards: 101. Max is 100."` | Cards exceed limit |
 | 400 | `"No cards provided."` | Empty card list |
+| 400 | `"No recognized Magic card names found after resolution."` | All card names failed Scryfall resolution |
 | 503 | `"Server busy: 1 fetch job(s) already running. …"` | Another fetch job is running (never with `cache_only`). A wizard job does not block fetch. |
 
 ---
@@ -88,9 +95,12 @@ Submits a card search. Behavior depends on `cache_only`:
 ### `POST /wizard`
 
 Finds the optimal store assignments from previously fetched (cached) card listings.
-Returns an array of up to **3 solutions**, sorted best-first. Exhaustive mode
-always returns up to 3 alternatives (different store combinations with similar cost);
-heuristic mode returns 1.
+Like `/fetch`, card names are resolved via Scryfall before lookup.
+
+Returns a response with `results` (array of up to **3 solutions**, sorted best-first)
+and `unrecognized` (names that couldn't be resolved). Exhaustive mode always returns
+up to 3 alternatives (different store combinations with similar cost); heuristic mode
+returns 1.
 
 If a suitable previously-computed solution is cached, it is returned immediately without
 creating a background job. A cached solution is "suitable" if it was computed
@@ -133,7 +143,8 @@ current request is exhaustive.
       "total_shipping": 2900,
       "num_stores": 1
     }
-  ]
+  ],
+  "unrecognized": []
 }
 ```
 
@@ -163,6 +174,7 @@ Each solution object has the same shape:
 |---|---|---|
 | 400 | `"Tolerance too high: 6. Max is 5."` | Tolerance > 5 |
 | 400 | `"No cached listings found. Run a /fetch first."` | No listings in cache |
+| 400 | `"No recognized Magic card names found after resolution."` | All card names failed Scryfall resolution |
 
 ---
 
@@ -252,13 +264,16 @@ frontend knows which progress fields to display.
   "combos_done": 0,
   "combos_total": 0,
   "result": {
-    "Lightning Bolt": [
-      { "store": "outland.no",    "price": 200, "url": "https://…" },
-      { "store": "cardmarket.com", "price": 350, "url": "https://…" }
-    ],
-    "Counterspell": [
-      { "store": "cardmarket.com", "price": 120, "url": "https://…" }
-    ]
+    "results": {
+      "Lightning Bolt": [
+        { "store": "outland.no",    "price": 200, "url": "https://…" },
+        { "store": "cardmarket.com", "price": 350, "url": "https://…" }
+      ],
+      "Counterspell": [
+        { "store": "cardmarket.com", "price": 120, "url": "https://…" }
+      ]
+    },
+    "unrecognized": []
   }
 }
 ```
@@ -276,25 +291,28 @@ frontend knows which progress fields to display.
   "tolerance_total": 3,
   "combos_done": 2048,
   "combos_total": 2048,
-  "result": [
-    {
-      "assignments": [
-        { "card": "Lightning Bolt", "store": "outland.no",    "price": 200, "url": "https://…" },
-        { "card": "Counterspell",   "store": null,             "price": null, "url": null }
-      ],
-      "skipped": ["Counterspell"],
-      "stores": [
-        { "name": "outland.no", "card_total": 200, "shipping": 2900 }
-      ],
-      "total_card_cost": 200,
-      "total_shipping": 2900,
-      "num_stores": 1
-    }
-  ]
+  "result": {
+    "results": [
+      {
+        "assignments": [
+          { "card": "Lightning Bolt", "store": "outland.no",    "price": 200, "url": "https://…" },
+          { "card": "Counterspell",   "store": null,             "price": null, "url": null }
+        ],
+        "skipped": ["Counterspell"],
+        "stores": [
+          { "name": "outland.no", "card_total": 200, "shipping": 2900 }
+        ],
+        "total_card_cost": 200,
+        "total_shipping": 2900,
+        "num_stores": 1
+      }
+    ],
+    "unrecognized": []
+  }
 }
 ```
 
-The `result` array contains up to **3 solutions**, sorted best-first.
+The `result.results` array contains up to **3 solutions**, sorted best-first.
 Exhaustive mode always returns up to 3 alternatives; heuristic mode returns 1.
 
 **Failed response:**
@@ -353,7 +371,8 @@ Jobs live in memory only. Restarting the server loses all active and completed j
 
 - [x] Server unreachable → show connection error
 - [x] `503` (server busy) → show "Server busy" message + retry button
-- [x] `400` (too many cards / tolerance too high) → show validation before submitting
+- [x] `400` (too many cards / tolerance too high / no recognized cards) → show validation before submitting
 - [x] `404` on `/jobs/{id}` → show "Job expired" (30min cleanup)
 - [x] `status: "failed"` → show the `error` field
 - [x] Network timeout during poll → don't crash, just try next interval
+- [x] `unrecognized` field in response → show warnings for misspelled/invalid card names

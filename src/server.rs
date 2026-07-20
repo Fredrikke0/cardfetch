@@ -61,10 +61,22 @@ impl From<StoreResult> for CardResultEntry {
 }
 
 #[derive(Serialize, Clone)]
+pub struct FetchResultData {
+    pub results: HashMap<String, Vec<CardResultEntry>>,
+    pub unrecognized: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct WizardResultData {
+    pub results: Vec<WizardResponseData>,
+    pub unrecognized: Vec<String>,
+}
+
+#[derive(Serialize, Clone)]
 #[serde(untagged)]
 pub enum JobResult {
-    Fetch(HashMap<String, Vec<CardResultEntry>>),
-    Wizard(Vec<WizardResponseData>),
+    Fetch(FetchResultData),
+    Wizard(WizardResultData),
 }
 
 #[derive(Serialize, Clone)]
@@ -391,6 +403,7 @@ async fn start_fetch(
     }
 
     // Resolve partial/ambiguous card names via Scryfall autocomplete.
+    let unrecognized: Vec<String>;
     {
         let client = reqwest::blocking::Client::builder()
             .user_agent("CardFetch/0.1")
@@ -398,8 +411,11 @@ async fn start_fetch(
             .build()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
-        cards = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let (resolved, unres) =
+            crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        cards = resolved;
+        unrecognized = unres;
     }
 
     // Determine which store indices are active.
@@ -426,7 +442,10 @@ async fn start_fetch(
             .as_ref()
             .map(|c| serve_cache_partial(c, &cards, &state.stores, &stores))
             .unwrap_or_default();
-        return Ok(Json(serde_json::json!({"results": results})));
+        return Ok(Json(serde_json::json!({
+            "results": results,
+            "unrecognized": unrecognized,
+        })));
     }
 
     // If we have a cache, check whether everything is already cached.
@@ -434,7 +453,8 @@ async fn start_fetch(
     if let Some(ref cache) = state.cache {
         if let Some(results) = try_serve_from_cache(cache, &cards, &state.stores, &stores) {
             return Ok(Json(serde_json::json!({
-                "results": results
+                "results": results,
+                "unrecognized": unrecognized,
             })));
         }
     }
@@ -478,6 +498,7 @@ async fn start_fetch(
     let cards_for_thread = cards.clone();
     let cards_done = cards_done.clone();
     let current = current.clone();
+    let unrecognized_for_job = unrecognized.clone();
 
     std::thread::spawn(move || {
         {
@@ -506,7 +527,10 @@ async fn start_fetch(
         let mut j = job_ref.lock().unwrap();
         j.status = "done".into();
         j.cards_done = cards_total;
-        j.result = Some(JobResult::Fetch(grouped));
+        j.result = Some(JobResult::Fetch(FetchResultData {
+            results: grouped,
+            unrecognized: unrecognized_for_job,
+        }));
     });
 
     Ok(Json(serde_json::json!({ "job_id": job_id })))
@@ -540,6 +564,7 @@ async fn start_wizard(
     }
 
     // Resolve card names via Scryfall so they match the /fetch cache keys.
+    let unrecognized: Vec<String>;
     {
         let client = reqwest::blocking::Client::builder()
             .user_agent("CardFetch/0.1")
@@ -547,8 +572,11 @@ async fn start_wizard(
             .build()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
-        cards = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let (resolved, unres) =
+            crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        cards = resolved;
+        unrecognized = unres;
     }
 
     let strategy = match req.strategy.as_str() {
@@ -632,7 +660,8 @@ async fn start_wizard(
                 })
                 .collect();
             return Ok(Json(serde_json::json!({
-                "results": WizardResponseData::from_solutions(&solutions)
+                "results": WizardResponseData::from_solutions(&solutions),
+                "unrecognized": unrecognized,
             })));
         }
         // Cache was non-exhaustive but request is exhaustive — fall through to compute.
@@ -681,6 +710,7 @@ async fn start_wizard(
     let exhaustive = req.exhaustive;
     let tolerance = req.tolerance;
     let eu = req.eu_destination;
+    let unrecognized_for_job = unrecognized.clone();
 
     std::thread::spawn(move || {
         {
@@ -758,9 +788,10 @@ async fn start_wizard(
 
         j.status = "done".into();
         j.tolerance_done = tolerance_total;
-        j.result = Some(JobResult::Wizard(WizardResponseData::from_solutions(
-            &max_tol_solutions,
-        )));
+        j.result = Some(JobResult::Wizard(WizardResultData {
+            results: WizardResponseData::from_solutions(&max_tol_solutions),
+            unrecognized: unrecognized_for_job,
+        }));
     });
 
     Ok(Json(serde_json::json!({ "job_id": job_id })))

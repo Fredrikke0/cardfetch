@@ -159,7 +159,12 @@ fn main() -> anyhow::Result<()> {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .context("Failed to build Scryfall HTTP client")?;
-            scryfall::resolve_with_cache(&client, &unique_cards, &Some(&cache))?
+            let (resolved, unrecognized) =
+                scryfall::resolve_with_cache(&client, &unique_cards, &Some(&cache))?;
+            for name in &unrecognized {
+                eprintln!("Warning: '{}' is not a recognized Magic card -- skipping.", name);
+            }
+            resolved
         };
 
         let listings = cache.get_listings(&unique_cards)?;
@@ -413,7 +418,12 @@ fn main() -> anyhow::Result<()> {
             .build()
             .context("Failed to build Scryfall HTTP client")?;
         let cache_ref: Option<&Cache> = cache.as_ref().map(|c| c.as_ref());
-        scryfall::resolve_with_cache(&client, &unique_cards, &cache_ref)?
+        let (resolved, unrecognized) =
+            scryfall::resolve_with_cache(&client, &unique_cards, &cache_ref)?;
+        for name in &unrecognized {
+            eprintln!("Warning: '{}' is not a recognized Magic card -- skipping.", name);
+        }
+        resolved
     };
 
     let num_cards = unique_cards.len();
