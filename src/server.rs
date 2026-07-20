@@ -843,7 +843,10 @@ async fn start_wizard(
     let input = wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
     let combos_total = if req.exhaustive {
         let candidates = wizard::select_candidate_stores(&input);
-        wizard::exhaustive_combo_total(&candidates)
+        // Estimate store-swap trials: candidates × (add + swap + remove) × iters
+        let n_c = candidates.len() as u64;
+        let stores_guess = 7u64;
+        n_c * (1 + stores_guess + 1) * 5
     } else {
         0
     };
@@ -899,8 +902,7 @@ async fn start_wizard(
 
         let exhaustive_candidates = if exhaustive {
             let c = wizard::select_candidate_stores(&input);
-            // Reset the global combo counter before the exhaustive run.
-            crate::wizard::EXHAUSTIVE_COMBO_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+            crate::wizard::SWAP_TRIAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
             Some(c)
         } else {
             None
@@ -908,14 +910,14 @@ async fn start_wizard(
 
         let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
         let mut solutions: Vec<(usize, WizardSolution)> = Vec::new();
+        let mut exhaustive_seed_score: Option<u64> = None;
 
         for t in 0..=tolerance {
             if let Some(ref candidates) = exhaustive_candidates {
-                // Reset counter at the start of each tolerance level.
-                crate::wizard::EXHAUSTIVE_COMBO_COUNT
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                crate::wizard::SWAP_TRIAL_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
                 search_mode = wizard::SearchMode::Exhaustive {
                     candidates: candidates.clone(),
+                    seed_score: exhaustive_seed_score,
                 };
             }
             let config = WizardConfig {
@@ -929,6 +931,17 @@ async fn start_wizard(
                     search_mode = wizard::SearchMode::Heuristic {
                         seed: Some(best.raw_choices.clone()),
                     };
+                } else if t < tolerance {
+                    // Seed the next tolerance level with the best solution from
+                    // this level, recomputed at the next tolerance so the score
+                    // is comparable.  Tightens the rejection bound early.
+                    let next_config = WizardConfig {
+                        strategy,
+                        tolerance: t + 1,
+                    };
+                    let next_sol =
+                        wizard::solution_from_choices(&best.raw_choices, &input, &next_config);
+                    exhaustive_seed_score = Some(next_sol.score);
                 }
                 for sol in results {
                     solutions.push((t, sol));
@@ -981,8 +994,7 @@ async fn get_job(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<JobResponse>, (StatusCode, String)> {
-    let combos_done =
-        crate::wizard::EXHAUSTIVE_COMBO_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let combos_done = crate::wizard::SWAP_TRIAL_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     let jobs = state.jobs.lock().unwrap();
     let job = jobs
         .get(&id)

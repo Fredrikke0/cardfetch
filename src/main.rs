@@ -267,10 +267,12 @@ fn main() -> anyhow::Result<()> {
 
         let mut solutions: Vec<(usize, wizard::WizardSolution)> = Vec::new();
         let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
+        let mut exhaustive_seed_score: Option<u64> = None;
         for t in 0..=cli.tolerance {
             if let Some(ref candidates) = exhaustive_candidates {
                 search_mode = wizard::SearchMode::Exhaustive {
                     candidates: candidates.clone(),
+                    seed_score: exhaustive_seed_score,
                 };
             }
             let config = WizardConfig {
@@ -304,6 +306,16 @@ fn main() -> anyhow::Result<()> {
                     search_mode = wizard::SearchMode::Heuristic {
                         seed: Some(seed_choices),
                     };
+                } else if t < cli.tolerance {
+                    // Seed the next exhaustive tolerance level with the best
+                    // solution from this level, recomputed at t+1.
+                    let next_config = WizardConfig {
+                        strategy: cli.strategy,
+                        tolerance: t + 1,
+                    };
+                    let next_sol =
+                        wizard::solution_from_choices(&best.raw_choices, &input, &next_config);
+                    exhaustive_seed_score = Some(next_sol.score);
                 }
                 for sol in results.into_iter() {
                     solutions.push((t, sol));

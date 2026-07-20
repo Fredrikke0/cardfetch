@@ -13,7 +13,6 @@
 
 use crate::shipping::{self, ShippingInfo};
 use crate::stores::StoreResult;
-use indicatif::{ProgressBar, ProgressStyle};
 use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
@@ -21,9 +20,9 @@ use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 
-/// Incremented by `SubsetEvaluator::try_subset` on every combo tested.
-/// Server mode reads this to report exhaustive wizard progress.
-pub(crate) static EXHAUSTIVE_COMBO_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Incremented by `try_store_set` during the store-swap refinement phase.
+/// Server mode reads this when `combos_total` is 0 (new exhaustive mode).
+pub(crate) static SWAP_TRIAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ── Configuration ────────────────────────────────────────────────────────────
 
@@ -854,24 +853,17 @@ pub(crate) enum SearchMode {
     /// Enumerate store combinations from a pruned candidate pool and greedily
     /// assign cards within each combination.  Candidates are pre-computed by
     /// `select_candidate_stores` and reused across tolerance levels.
-    Exhaustive { candidates: Vec<usize> },
+    ///
+    /// `seed_score` is the best known score from a *lower* tolerance level
+    /// (recomputed at this tolerance).  It initialises the rejection bound so
+    /// combos that can't beat the previous level's solution are skipped early.
+    Exhaustive {
+        candidates: Vec<usize>,
+        seed_score: Option<u64>,
+    },
 }
-
-/// Maximum number of stores to try in a combination during exhaustive search.
-const EXHAUSTIVE_MAX_STORES: usize = 5;
 
 // ── Candidate store selection ──────────────────────────────────────────────────
-
-/// Compute the strategy-specific base score contribution for a k-store subset.
-/// This is the part of the score that depends only on k (not on which stores
-/// or cards are chosen), used for lower-bound rejection in exhaustive search.
-#[inline]
-fn k_base_score(k: usize, strategy: Strategy) -> u64 {
-    match strategy {
-        Strategy::Simplest => (k as u64) * PRICE_WEIGHT,
-        Strategy::Cheapest => (k.saturating_sub(1) as u64) * STORE_PENALTY,
-    }
-}
 
 /// When evaluating INT sellers for saturation: a seller is "useful" if it
 /// carries at least this many cards.  Consolidation only matters if the
@@ -1100,731 +1092,6 @@ pub(crate) fn select_candidate_stores(input: &WizardInput) -> Vec<usize> {
     candidates
 }
 
-/// Estimate total store combinations for a candidate set, matching the
-/// calculation in `optimize_exhaustive`.  Used by server mode to report
-/// progress (combos_total).
-pub(crate) fn exhaustive_combo_total(candidates: &[usize]) -> u64 {
-    let max_stores = EXHAUSTIVE_MAX_STORES.min(candidates.len());
-    (1..=max_stores)
-        .map(|k| {
-            let nf = candidates.len() as u64;
-            let mut c = 1u64;
-            for i in 0..k as u64 {
-                c = c * (nf - i) / (i + 1);
-            }
-            c
-        })
-        .sum()
-}
-
-/// Maximum number of top solutions to keep per tolerance level.
-const TOP_N: usize = 3;
-
-/// Score a candidate subset during exhaustive search with O(1) lower-bound
-/// rejection, progress-bar flushing, and best-tracking.
-///
-/// This is the inner loop of the exhaustive search, shared by k=4 parallel,
-/// k=5 parallel, and the generic sequential sections.
-struct SubsetEvaluator<'a> {
-    input: &'a WizardInput,
-    config: &'a WizardConfig,
-    choices_buf: &'a mut [Option<usize>],
-    totals_buf: &'a mut [u64],
-    global_mins_sum: u64,
-    min_shipping_base: u64,
-    /// Suffix sum of per-card global minima across all candidates.
-    /// global_suffix[ci] = sum_{j=ci}^{n-1} min price for card j.
-    /// Used for early bail in score_store_subset.
-    global_suffix: &'a [u64],
-    /// Sorted best scores (ascending), up to TOP_N entries.
-    /// Each entry: (subset, choices, score).
-    local_best: Vec<(Vec<usize>, Vec<Option<usize>>, u64)>,
-    bar_acc: u64,
-    bar: &'a ProgressBar,
-}
-
-impl<'a> SubsetEvaluator<'a> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        input: &'a WizardInput,
-        config: &'a WizardConfig,
-        choices_buf: &'a mut [Option<usize>],
-        totals_buf: &'a mut [u64],
-        global_mins_sum: u64,
-        min_shipping_base: u64,
-        global_suffix: &'a [u64],
-        bar: &'a ProgressBar,
-    ) -> Self {
-        Self {
-            input,
-            config,
-            choices_buf,
-            totals_buf,
-            global_mins_sum,
-            min_shipping_base,
-            global_suffix,
-            local_best: Vec::with_capacity(TOP_N),
-            bar_acc: 0,
-            bar,
-        }
-    }
-
-    /// Worst score among the top N so far (u64::MAX if fewer than N).
-    fn worst_best_score(&self) -> u64 {
-        if self.local_best.len() >= TOP_N {
-            self.local_best
-                .last()
-                .map(|(_, _, s)| *s)
-                .unwrap_or(u64::MAX)
-        } else {
-            u64::MAX
-        }
-    }
-
-    #[inline]
-    fn try_subset(&mut self, subset: &[usize]) {
-        self.bar_acc += 1;
-        EXHAUSTIVE_COMBO_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.bar_acc >= 100_000 {
-            self.bar.inc(self.bar_acc);
-            self.bar_acc = 0;
-        }
-
-        let k_base = k_base_score(subset.len(), self.config.strategy);
-        if self.global_mins_sum + self.min_shipping_base + k_base >= self.worst_best_score() {
-            return;
-        }
-
-        let score = match score_store_subset(
-            self.input,
-            self.config,
-            subset,
-            self.choices_buf,
-            self.totals_buf,
-            self.worst_best_score(),
-            self.global_suffix,
-        ) {
-            Some(s) => s,
-            None => return, // bailed early — can't beat current top N
-        };
-
-        // Insert into sorted top-N list.
-        let entry = (subset.to_vec(), self.choices_buf.to_vec(), score);
-        let pos = self.local_best.partition_point(|(_, _, s)| *s < score);
-        if pos < TOP_N {
-            self.local_best.insert(pos, entry);
-            self.local_best.truncate(TOP_N);
-        }
-    }
-
-    fn finish(self) -> Vec<(Vec<usize>, Vec<Option<usize>>, u64)> {
-        if self.bar_acc > 0 {
-            self.bar.inc(self.bar_acc);
-        }
-        self.local_best
-    }
-}
-
-/// Score a specific store subset: greedily assigns each card to the cheapest
-/// store in the subset that carries it (or skips the card).
-///
-/// Returns `None` if the partial score mid-assignment already exceeds
-/// `worst_best_score` (early bail).  The caller's `choices_out` / `store_totals_out`
-/// are left in an intermediate state in that case — the caller must discard them.
-///
-/// Writes the resulting option choices into `choices_out` (must be at least
-/// `input.card_count()` elements) and card subtotals into `store_totals_out`
-/// (must be at least `store_subset.len()` elements; the first k entries are
-/// zeroed on entry).  Returns the composite score on success.
-///
-/// The caller owns the buffers and can reuse them across calls to avoid
-/// per-combination allocations.
-#[allow(clippy::needless_range_loop)]
-fn score_store_subset(
-    input: &WizardInput,
-    config: &WizardConfig,
-    store_subset: &[usize],
-    choices_out: &mut [Option<usize>],
-    store_totals_out: &mut [u64],
-    worst_best_score: u64,
-    global_suffix: &[u64],
-) -> Option<u64> {
-    let n = input.card_count();
-    let k = store_subset.len();
-    debug_assert!(choices_out.len() >= n);
-    debug_assert!(store_totals_out.len() >= k);
-
-    let k_base = k_base_score(k, config.strategy);
-
-    store_totals_out[..k].fill(0);
-    // Track card counts per store for shipping tier calculation.
-    let mut card_counts = [0usize; 6];
-    debug_assert!(k <= 6);
-    let mut num_skipped = 0usize;
-    let mut running_card_total: u64 = 0;
-
-    // ── Early-bail helper: check running card total against suffix ───────
-    // Inlined manually in each branch to avoid function-call overhead.
-    // After processing card `ci`, if even free shipping + global-minimum
-    // prices for remaining cards can't beat worst_best_score, bail.
-    macro_rules! check_a {
-        ($ci:expr) => {
-            if running_card_total + global_suffix[$ci + 1] + k_base >= worst_best_score {
-                return None;
-            }
-        };
-    }
-
-    // Unrolled fast paths for common k values — avoids loop overhead
-    // and enumerate() per card.  option_indices are only read for the
-    // winning store, saving (k-1)/k of the oi memory bandwidth.
-    if k == 3 {
-        let s0 = store_subset[0];
-        let s1 = store_subset[1];
-        let s2 = store_subset[2];
-        let n_st = input.store_names.len();
-        for ci in 0..n {
-            let off = ci * n_st;
-            let p0 = input.prices[off + s0];
-            let p1 = input.prices[off + s1];
-            let p2 = input.prices[off + s2];
-            let mut best_price = u32::MAX;
-            let mut best_oi = None;
-            let mut best_pos = 0usize;
-            if p0 < best_price {
-                best_price = p0;
-                best_oi = Some(input.option_indices[off + s0] as usize);
-            }
-            if p1 < best_price {
-                best_price = p1;
-                best_oi = Some(input.option_indices[off + s1] as usize);
-                best_pos = 1;
-            }
-            if p2 < best_price {
-                best_price = p2;
-                best_oi = Some(input.option_indices[off + s2] as usize);
-                best_pos = 2;
-            }
-            choices_out[ci] = best_oi;
-            if best_price != u32::MAX {
-                store_totals_out[best_pos] += best_price as u64;
-                card_counts[best_pos] += 1;
-                running_card_total += best_price as u64;
-            } else {
-                num_skipped += 1;
-            }
-            check_a!(ci);
-        }
-    } else if k == 4 {
-        let s0 = store_subset[0];
-        let s1 = store_subset[1];
-        let s2 = store_subset[2];
-        let s3 = store_subset[3];
-        let n_st = input.store_names.len();
-        for ci in 0..n {
-            let off = ci * n_st;
-            let p0 = input.prices[off + s0];
-            let p1 = input.prices[off + s1];
-            let p2 = input.prices[off + s2];
-            let p3 = input.prices[off + s3];
-
-            let mut best_price = u32::MAX;
-            let mut best_oi = None;
-            let mut best_pos = 0usize;
-
-            if p0 < best_price {
-                best_price = p0;
-                best_oi = Some(input.option_indices[off + s0] as usize);
-            }
-            if p1 < best_price {
-                best_price = p1;
-                best_oi = Some(input.option_indices[off + s1] as usize);
-                best_pos = 1;
-            }
-            if p2 < best_price {
-                best_price = p2;
-                best_oi = Some(input.option_indices[off + s2] as usize);
-                best_pos = 2;
-            }
-            if p3 < best_price {
-                best_price = p3;
-                best_oi = Some(input.option_indices[off + s3] as usize);
-                best_pos = 3;
-            }
-
-            choices_out[ci] = best_oi;
-            if best_price != u32::MAX {
-                store_totals_out[best_pos] += best_price as u64;
-                card_counts[best_pos] += 1;
-                running_card_total += best_price as u64;
-            } else {
-                num_skipped += 1;
-            }
-            check_a!(ci);
-        }
-    } else {
-        let n_st = input.store_names.len();
-        for ci in 0..n {
-            let mut best_price = u32::MAX;
-            let mut best_oi = None;
-            let mut best_pos = 0usize;
-            let off = ci * n_st;
-            for (pos, &si) in store_subset.iter().enumerate() {
-                let p = input.prices[off + si];
-                if p < best_price {
-                    best_price = p;
-                    best_oi = Some(input.option_indices[off + si] as usize);
-                    best_pos = pos;
-                }
-            }
-            choices_out[ci] = best_oi;
-            if best_price != u32::MAX {
-                store_totals_out[best_pos] += best_price as u64;
-                card_counts[best_pos] += 1;
-                running_card_total += best_price as u64;
-            } else {
-                num_skipped += 1;
-            }
-
-            // Check A: every-card O(1) lower bound via global suffix.
-            check_a!(ci);
-
-            // Check B: every 8 cards, compute real partial score.  Assumes
-            // worst case for remaining cards (all skipped).  O(k) but
-            // amortized to ~12% overhead.
-            if ci % 8 == 7 && ci + 1 < n {
-                let partial_card: u64 = store_totals_out[..k].iter().sum();
-                let partial_shipping: u64 = store_subset
-                    .iter()
-                    .zip(store_totals_out[..k].iter())
-                    .zip(card_counts[..k].iter())
-                    .map(|((&si, &total), &count)| input.shipping_cost(si, total, count))
-                    .sum();
-                let stores_used = card_counts[..k].iter().filter(|&&c| c > 0).count();
-                // Worst case: all remaining cards are skipped.
-                let worst_skipped = num_skipped + (n - ci - 1);
-                let partial_score = compute_raw_score(
-                    partial_card + partial_shipping,
-                    stores_used,
-                    worst_skipped,
-                    config.tolerance,
-                    config.strategy,
-                );
-                if partial_score >= worst_best_score {
-                    return None;
-                }
-            }
-        }
-    }
-
-    let card_total: u64 = store_totals_out[..k].iter().sum();
-    let shipping: u64 = store_subset
-        .iter()
-        .zip(store_totals_out[..k].iter())
-        .zip(card_counts[..k].iter())
-        .map(|((&si, &total), &count)| input.shipping_cost(si, total, count))
-        .sum();
-
-    let num_stores_used = card_counts[..k].iter().filter(|&&c| c > 0).count();
-    Some(compute_raw_score(
-        card_total + shipping,
-        num_stores_used,
-        num_skipped,
-        config.tolerance,
-        config.strategy,
-    ))
-}
-
-/// Exhaustively search for the optimal store assignment by enumerating
-/// store combinations from a pruned candidate pool.
-///
-/// `candidates` should be pre-computed by `select_candidate_stores` and
-/// reused across tolerance levels — it depends only on `input`, not on
-/// `config`.
-fn optimize_exhaustive(
-    input: &WizardInput,
-    config: &WizardConfig,
-    candidates: &[usize],
-) -> Option<Vec<WizardSolution>> {
-    let n = input.card_count();
-    let n_stores = input.store_names.len();
-
-    let max_stores = EXHAUSTIVE_MAX_STORES.min(candidates.len());
-
-    // Estimate total combinations for the progress bar.
-    let total_combos: u64 = (1..=max_stores)
-        .map(|k| {
-            let nf = candidates.len() as u64;
-            let mut c = 1u64;
-            for i in 0..k as u64 {
-                c = c * (nf - i) / (i + 1);
-            }
-            c
-        })
-        .sum();
-
-    eprintln!(
-        "  [exhaustive] {} cards x {} stores -> {} candidates, {} combos (max {} stores)",
-        n,
-        n_stores,
-        candidates.len(),
-        total_combos,
-        max_stores,
-    );
-    if candidates.len() > 500 {
-        eprintln!(
-            "  [exhaustive] Very large candidate pool ({}). Consider filtering with --stores.",
-            candidates.len()
-        );
-    }
-
-    // Precompute global minima for O(1) lower-bound rejection.
-    // Even if every card got its global best price from one store with
-    // minimum shipping, can a k-store combo beat the current best?  If
-    // not, the full O(n*k) scoring is skipped.  As local_best_score
-    // improves, more combos are rejected for free.
-    let global_mins_sum: u64 = (0..n)
-        .map(|ci| {
-            candidates
-                .iter()
-                .filter_map(|&si| input.cheapest_at(ci, si).map(|(_, p)| p as u64))
-                .min()
-                .unwrap_or(0)
-        })
-        .sum();
-    let min_shipping_base: u64 = candidates
-        .iter()
-        .map(|&si| input.shipping_bases[si] as u64)
-        .min()
-        .unwrap_or(0);
-
-    // Per-card global minima and suffix sum for early bail in score_store_subset.
-    // global_card_min[ci] = cheapest price for card ci among ALL candidates.
-    // global_suffix[ci]   = sum of global_card_min for cards ci..n-1.
-    let global_card_min: Vec<u64> = (0..n)
-        .map(|ci| {
-            candidates
-                .iter()
-                .filter_map(|&si| input.cheapest_at(ci, si).map(|(_, p)| p as u64))
-                .min()
-                .unwrap_or(SKIP_PENALTY) // unavailable → forced skip, penalize
-        })
-        .collect();
-    let mut global_suffix = vec![0u64; n + 1];
-    for ci in (0..n).rev() {
-        global_suffix[ci] = global_suffix[ci + 1] + global_card_min[ci];
-    }
-
-    let bar = ProgressBar::new(total_combos).with_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({per_sec} combo/s)",
-        )
-        .unwrap()
-        .progress_chars("#>-"),
-    );
-
-    // Process each k in parallel; within each k, generate combinations
-    // sequentially on-the-fly to avoid pre-allocating millions of Vecs.
-    //
-    // k=4 dominates combinatorially (~99.9% of combos), so we parallelize
-    // it over the first combination index `a`.  k=1..3 use the existing
-    // sequential lexicographic enumeration with reusable buffers.
-
-    // ── k=4: parallelize over the first index ───────────────────────────
-    // Use thread-local buffers to avoid per-task Vec allocation.
-    thread_local! {
-        static CHOICES_BUF: std::cell::RefCell<Vec<Option<usize>>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-        static CHOICES_BUF_K5: std::cell::RefCell<Vec<Option<usize>>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-        static CHOICES_BUF_K6: std::cell::RefCell<Vec<Option<usize>>> =
-            const { std::cell::RefCell::new(Vec::new()) };
-    }
-    // Helper: merge two top-N lists, keeping only the best N entries.
-    #[allow(clippy::type_complexity)]
-    fn merge_top_n(
-        a: &mut Vec<(Vec<usize>, Vec<Option<usize>>, u64)>,
-        b: &mut Vec<(Vec<usize>, Vec<Option<usize>>, u64)>,
-    ) {
-        a.append(b);
-        a.sort_by_key(|(_, _, s)| *s);
-        a.truncate(TOP_N);
-    }
-
-    let best_k4: Vec<(Vec<usize>, Vec<Option<usize>>, u64)> = if max_stores >= 4 {
-        let n_c = candidates.len();
-        let n_a = n_c.saturating_sub(4) + 1;
-        let card_count = input.card_count();
-        (0..n_a)
-            .into_par_iter()
-            .with_min_len(1) // fine-grained splitting for load balance
-            .fold(
-                Vec::new,
-                |mut acc: Vec<(Vec<usize>, Vec<Option<usize>>, u64)>, a| {
-                    CHOICES_BUF.with(|buf| {
-                        let mut choices_buf = buf.borrow_mut();
-                        choices_buf.resize(card_count, None);
-                        let mut totals_buf = [0u64; 4];
-                        let mut eval = SubsetEvaluator::new(
-                            input,
-                            config,
-                            &mut choices_buf,
-                            &mut totals_buf,
-                            global_mins_sum,
-                            min_shipping_base,
-                            &global_suffix,
-                            &bar,
-                        );
-
-                        for b in (a + 1)..=(n_c.saturating_sub(3)) {
-                            for c in (b + 1)..=(n_c.saturating_sub(2)) {
-                                for d in (c + 1)..=(n_c.saturating_sub(1)) {
-                                    eval.try_subset(&[
-                                        candidates[a],
-                                        candidates[b],
-                                        candidates[c],
-                                        candidates[d],
-                                    ]);
-                                }
-                            }
-                        }
-
-                        acc.extend(eval.finish());
-                        acc.sort_by_key(|(_, _, s)| *s);
-                        acc.truncate(TOP_N);
-                        acc
-                    })
-                },
-            )
-            .reduce(Vec::new, |mut a, mut b| {
-                merge_top_n(&mut a, &mut b);
-                a
-            })
-    } else {
-        Vec::new()
-    };
-
-    let best_k5: Vec<(Vec<usize>, Vec<Option<usize>>, u64)> = if max_stores >= 5 {
-        let n_c = candidates.len();
-        let n_a = n_c.saturating_sub(5) + 1;
-        let card_count = input.card_count();
-        (0..n_a)
-            .into_par_iter()
-            .with_min_len(1)
-            .fold(
-                Vec::new,
-                |mut acc: Vec<(Vec<usize>, Vec<Option<usize>>, u64)>, a| {
-                    CHOICES_BUF_K5.with(|buf| {
-                        let mut choices_buf = buf.borrow_mut();
-                        choices_buf.resize(card_count, None);
-                        let mut totals_buf = [0u64; 5];
-                        let mut eval = SubsetEvaluator::new(
-                            input,
-                            config,
-                            &mut choices_buf,
-                            &mut totals_buf,
-                            global_mins_sum,
-                            min_shipping_base,
-                            &global_suffix,
-                            &bar,
-                        );
-
-                        for b in (a + 1)..=(n_c.saturating_sub(4)) {
-                            for c in (b + 1)..=(n_c.saturating_sub(3)) {
-                                for d in (c + 1)..=(n_c.saturating_sub(2)) {
-                                    for e in (d + 1)..=(n_c.saturating_sub(1)) {
-                                        eval.try_subset(&[
-                                            candidates[a],
-                                            candidates[b],
-                                            candidates[c],
-                                            candidates[d],
-                                            candidates[e],
-                                        ]);
-                                    }
-                                }
-                            }
-                        }
-
-                        acc.extend(eval.finish());
-                        acc.sort_by_key(|(_, _, s)| *s);
-                        acc.truncate(TOP_N);
-                        acc
-                    })
-                },
-            )
-            .reduce(Vec::new, |mut a, mut b| {
-                merge_top_n(&mut a, &mut b);
-                a
-            })
-    } else {
-        Vec::new()
-    };
-
-    let best_k6: Vec<(Vec<usize>, Vec<Option<usize>>, u64)> = if max_stores >= 6 {
-        let n_c = candidates.len();
-        let n_a = n_c.saturating_sub(6) + 1;
-        let card_count = input.card_count();
-        (0..n_a)
-            .into_par_iter()
-            .with_min_len(1)
-            .fold(
-                Vec::new,
-                |mut acc: Vec<(Vec<usize>, Vec<Option<usize>>, u64)>, a| {
-                    CHOICES_BUF_K6.with(|buf| {
-                        let mut choices_buf = buf.borrow_mut();
-                        choices_buf.resize(card_count, None);
-                        let mut totals_buf = [0u64; 6];
-                        let mut eval = SubsetEvaluator::new(
-                            input,
-                            config,
-                            &mut choices_buf,
-                            &mut totals_buf,
-                            global_mins_sum,
-                            min_shipping_base,
-                            &global_suffix,
-                            &bar,
-                        );
-
-                        for b in (a + 1)..=(n_c.saturating_sub(5)) {
-                            for c in (b + 1)..=(n_c.saturating_sub(4)) {
-                                for d in (c + 1)..=(n_c.saturating_sub(3)) {
-                                    for e in (d + 1)..=(n_c.saturating_sub(2)) {
-                                        for f in (e + 1)..=(n_c.saturating_sub(1)) {
-                                            eval.try_subset(&[
-                                                candidates[a],
-                                                candidates[b],
-                                                candidates[c],
-                                                candidates[d],
-                                                candidates[e],
-                                                candidates[f],
-                                            ]);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        acc.extend(eval.finish());
-                        acc.sort_by_key(|(_, _, s)| *s);
-                        acc.truncate(TOP_N);
-                        acc
-                    })
-                },
-            )
-            .reduce(Vec::new, |mut a, mut b| {
-                merge_top_n(&mut a, &mut b);
-                a
-            })
-    } else {
-        Vec::new()
-    };
-
-    // ── k=1..3 and k=7+: sequential lexicographic enumeration ───────────
-    // Uses thread-local buffer for choices_out (same as k=4/k=5 sections).
-    let best_small: Vec<(Vec<usize>, Vec<Option<usize>>, u64)> = (1..=max_stores)
-        .into_par_iter()
-        .fold(
-            Vec::new,
-            |mut acc: Vec<(Vec<usize>, Vec<Option<usize>>, u64)>, k| {
-                if k == 4 || k == 5 || k == 6 {
-                    return acc;
-                }
-                let n_c = candidates.len();
-                if k > n_c {
-                    return acc;
-                }
-
-                let card_count = input.card_count();
-                CHOICES_BUF.with(|buf| {
-                    let mut choices_buf = buf.borrow_mut();
-                    choices_buf.resize(card_count, None);
-                    // totals_buf is small (max 5 elements) — keep on stack.
-                    let mut totals_buf = [0u64; EXHAUSTIVE_MAX_STORES];
-                    let mut subset_buf: Vec<usize> = Vec::with_capacity(k);
-                    let mut eval = SubsetEvaluator::new(
-                        input,
-                        config,
-                        &mut choices_buf,
-                        &mut totals_buf,
-                        global_mins_sum,
-                        min_shipping_base,
-                        &global_suffix,
-                        &bar,
-                    );
-                    let mut combo: Vec<usize> = (0..k).collect();
-
-                    loop {
-                        subset_buf.clear();
-                        for &i in &combo {
-                            subset_buf.push(candidates[i]);
-                        }
-
-                        eval.try_subset(&subset_buf);
-
-                        // Next combination (lexicographic order).
-                        let mut i = k;
-                        while i > 0 {
-                            i -= 1;
-                            if combo[i] != i + n_c - k {
-                                break;
-                            }
-                        }
-                        if i == 0 && combo[0] == n_c - k {
-                            break;
-                        }
-                        combo[i] += 1;
-                        for j in (i + 1)..k {
-                            combo[j] = combo[j - 1] + 1;
-                        }
-                    }
-
-                    acc.extend(eval.finish());
-                    acc.sort_by_key(|(_, _, s)| *s);
-                    acc.truncate(TOP_N);
-                    acc
-                }) // CHOICES_BUF.with()
-            },
-        )
-        .reduce(Vec::new, |mut a, mut b| {
-            merge_top_n(&mut a, &mut b);
-            a
-        });
-
-    // ── Merge results ───────────────────────────────────────────────────
-    let mut merged: Vec<(Vec<usize>, Vec<Option<usize>>, u64)> = Vec::new();
-    let mut parts = [best_k4, best_k5, best_k6, best_small];
-    for part in &mut parts {
-        merged.append(part);
-    }
-    merged.sort_by_key(|(_, _, s)| *s);
-    // Deduplicate by card assignment — different store subsets can
-    // produce the same greedy assignment.  Keep only the best-scoring
-    // instance of each unique choice vector.
-    let mut uniq: Vec<Vec<Option<usize>>> = Vec::with_capacity(merged.len());
-    merged.retain(|(_, choices, _)| {
-        if uniq.iter().any(|u| u == choices) {
-            false
-        } else {
-            uniq.push(choices.clone());
-            true
-        }
-    });
-    merged.truncate(TOP_N);
-
-    bar.finish();
-
-    let solutions: Vec<WizardSolution> = merged
-        .into_iter()
-        .map(|(_subset, choices, _score)| solution_from_choices(&choices, input, config))
-        .collect();
-
-    if solutions.is_empty() {
-        None
-    } else {
-        Some(solutions)
-    }
-}
-
 /// Reconstruct a `WizardSolution` from stored `raw_choices`.
 /// Used to display a previous run's solution that beat the current one.
 pub(crate) fn solution_from_choices(
@@ -1859,8 +1126,12 @@ pub(crate) fn optimize_input(
     mode: &SearchMode,
 ) -> Vec<WizardSolution> {
     // ── Exhaustive path ──────────────────────────────────────────────────
-    if let SearchMode::Exhaustive { candidates } = mode {
-        if let Some(solutions) = optimize_exhaustive(input, config, candidates) {
+    if let SearchMode::Exhaustive {
+        candidates,
+        seed_score,
+    } = mode
+    {
+        if let Some(solutions) = optimize_exhaustive(input, config, candidates, *seed_score) {
             return solutions;
         }
     }
@@ -1871,6 +1142,19 @@ pub(crate) fn optimize_input(
         SearchMode::Exhaustive { .. } => None,
     };
 
+    let best = run_heuristic(input, config, seed);
+    best.map(|a| build_solution(&a, input))
+        .into_iter()
+        .collect()
+}
+
+/// Run the heuristic optimizer: multi-start hill climbing + iterated local
+/// search with simulated annealing.  Returns the single best assignment found.
+fn run_heuristic(
+    input: &WizardInput,
+    config: &WizardConfig,
+    seed: Option<&[Option<usize>]>,
+) -> Option<ScoredAssignment> {
     let mut rng = rand::thread_rng();
     let mut best: Option<ScoredAssignment> = None;
     let mut best_score: Option<u64> = None;
@@ -1981,13 +1265,173 @@ pub(crate) fn optimize_input(
         }
     }
 
-    best.map(|a| build_solution(&a, input))
-        .into_iter()
+    best
+}
+
+/// Greedily assign each card to the cheapest store in `store_set` that
+/// carries it.  Cards not available in any store in the set are skipped.
+fn greedy_assign(input: &WizardInput, store_set: &[usize]) -> Assignment {
+    let n = input.card_count();
+    let set: HashSet<usize> = store_set.iter().copied().collect();
+    let mut choices = vec![None; n];
+    for (ci, choice) in choices.iter_mut().enumerate().take(n) {
+        let best = input.cards[ci]
+            .options
+            .iter()
+            .enumerate()
+            .filter(|(_, opt)| set.contains(&opt.store_idx))
+            .min_by_key(|(_, opt)| opt.price);
+        *choice = best.map(|(oi, _)| oi);
+    }
+    Assignment { choices }
+}
+
+/// Extract the set of store indices currently used in a scored assignment.
+fn used_store_indices(sa: &ScoredAssignment) -> Vec<usize> {
+    sa.cards_at
+        .iter()
+        .enumerate()
+        .filter(|(_, cards)| !cards.is_empty())
+        .map(|(si, _)| si)
         .collect()
 }
 
-// ── Initial assignment builders ──────────────────────────────────────────────
+/// Build a trial store set by adding and/or removing one store, run greedy
+/// assignment + hill-climb, and return the resulting scored assignment.
+fn try_store_set(
+    input: &WizardInput,
+    config: &WizardConfig,
+    current: &[usize],
+    add: Option<usize>,
+    remove: Option<usize>,
+) -> ScoredAssignment {
+    let mut trial: Vec<usize> = current
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != remove)
+        .map(|(_, &s)| s)
+        .collect();
+    if let Some(si) = add {
+        trial.push(si);
+    }
+    SWAP_TRIAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let raw = greedy_assign(input, &trial);
+    hill_climb(ScoredAssignment::new(raw, input, config), input, config)
+}
 
+/// Explore alternative store combinations by trying add/swap/remove
+/// operations on the store set.  For each trial set, does greedy assignment
+/// followed by hill-climbing.  Continues until no improvement is found.
+fn store_swap_search(
+    input: &WizardInput,
+    config: &WizardConfig,
+    candidates: &[usize],
+    initial: &ScoredAssignment,
+) -> ScoredAssignment {
+    let mut best = initial.clone();
+
+    loop {
+        let old_score = best.score;
+        let current_stores = used_store_indices(&best);
+        let mut best_trial: Option<ScoredAssignment> = None;
+
+        // Add a store.
+        for &new_si in candidates {
+            if current_stores.contains(&new_si) {
+                continue;
+            }
+            let trial = try_store_set(input, config, &current_stores, Some(new_si), None);
+            if trial.score < old_score && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
+            {
+                best_trial = Some(trial);
+            }
+        }
+
+        // Swap a store (replace one current store with a candidate).
+        for (idx, _) in current_stores.iter().enumerate() {
+            for &new_si in candidates {
+                if current_stores.contains(&new_si) {
+                    continue;
+                }
+                let trial = try_store_set(input, config, &current_stores, Some(new_si), Some(idx));
+                if trial.score < old_score
+                    && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
+                {
+                    best_trial = Some(trial);
+                }
+            }
+        }
+
+        // Remove a store (if more than one).
+        if current_stores.len() > 1 {
+            for (idx, _) in current_stores.iter().enumerate() {
+                let trial = try_store_set(input, config, &current_stores, None, Some(idx));
+                if trial.score < old_score
+                    && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
+                {
+                    best_trial = Some(trial);
+                }
+            }
+        }
+
+        match best_trial {
+            Some(trial) => best = trial,
+            None => break,
+        }
+    }
+
+    best
+}
+
+/// Exhaustively search for the optimal store assignment.
+///
+/// Phase 1: multi-start hill climbing + ILS + SA (same as heuristic mode).
+/// Phase 2: store-swap local search that tries add/swap/remove operations
+/// on the store set, with greedy re-assignment + hill-climbing for each
+/// trial set.  Continues until convergence.
+fn optimize_exhaustive(
+    input: &WizardInput,
+    config: &WizardConfig,
+    candidates: &[usize],
+    _seed_score: Option<u64>,
+) -> Option<Vec<WizardSolution>> {
+    let n = input.card_count();
+    let n_stores = input.store_names.len();
+
+    eprintln!(
+        "  [exhaustive] {} cards x {} stores -> {} candidates",
+        n,
+        n_stores,
+        candidates.len(),
+    );
+
+    // Phase 1: heuristic baseline.
+    let baseline = run_heuristic(input, config, None)?;
+    eprintln!(
+        "  [exhaustive] phase 1 (heuristic): {} stores, score {}",
+        used_store_indices(&baseline).len(),
+        baseline.score,
+    );
+
+    // Phase 2: store-swap refinement.
+    let refined = store_swap_search(input, config, candidates, &baseline);
+    let refined_stores = used_store_indices(&refined).len();
+    if refined.score < baseline.score {
+        eprintln!(
+            "  [exhaustive] phase 2 (store-swap): improved to {} stores, score {}",
+            refined_stores, refined.score,
+        );
+    } else {
+        eprintln!(
+            "  [exhaustive] phase 2 (store-swap): no improvement, keeping {} stores",
+            refined_stores,
+        );
+    }
+
+    Some(vec![build_solution(&refined, input)])
+}
+
+// ── Initial assignment builders ──────────────────────────────────────────────
 fn initial_assignment(input: &WizardInput, seed: usize) -> Assignment {
     // Both strategies start from greedy set cover — this gives a strong
     // baseline with few stores and low shipping.  The strategy-specific
