@@ -263,8 +263,9 @@ impl AppState {
 
     /// Try to reserve a job slot for a given kind.
     /// Cleans up completed/failed jobs older than 30 minutes.
-    /// Returns Err with 503 if too many jobs of the same kind are already active.
-    fn reserve_slot(&self, kind: JobKind) -> Result<(), (StatusCode, String)> {
+    /// Returns Err with 503 and the blocking job IDs if too many jobs of the same
+    /// kind are already active.
+    fn reserve_slot(&self, kind: JobKind) -> Result<(), (StatusCode, String, Vec<String>)> {
         let mut jobs = self.jobs.lock().unwrap();
         let now = std::time::Instant::now();
         let ttl = Duration::from_secs(1800); // 30 minutes
@@ -275,6 +276,7 @@ impl AppState {
             !(j.status == "done" || j.status == "failed") || now.duration_since(j.created_at) < ttl
         });
 
+        // Fast path: count without allocating (same as before).
         let active = jobs
             .values()
             .filter(|j| {
@@ -289,12 +291,22 @@ impl AppState {
         };
 
         if active >= MAX_ACTIVE_JOBS {
+            // Only collect IDs on the (rare) error path.
+            let active_ids: Vec<String> = jobs
+                .iter()
+                .filter(|(_, j)| {
+                    let j = j.lock().unwrap();
+                    (j.status == "pending" || j.status == "running") && j.kind == kind
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "Server busy: {} {kind_name} job(s) already running. Try again in a moment.",
                     active
                 ),
+                active_ids,
             ))
         } else {
             Ok(())
@@ -321,6 +333,24 @@ async fn get_stores(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     Json(names)
 }
 
+/// Build the list of all (card_name, store_key) pairs that need checking.
+fn all_cache_pairs(
+    cards: &[String],
+    all_stores: &[Box<dyn Store>],
+    store_indices: &[usize],
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for &si in store_indices {
+        let store = &all_stores[si];
+        for key in &store.cache_keys() {
+            for card_name in cards {
+                pairs.push((card_name.clone(), key.clone()));
+            }
+        }
+    }
+    pairs
+}
+
 /// Always returns cached results, skipping any entries that aren't cached.
 /// Used by `cache_only` mode — never returns None.
 fn serve_cache_partial(
@@ -329,18 +359,19 @@ fn serve_cache_partial(
     all_stores: &[Box<dyn Store>],
     store_indices: &[usize],
 ) -> std::collections::HashMap<String, Vec<CardResultEntry>> {
+    let pairs = all_cache_pairs(cards, all_stores, store_indices);
+    let batch = match cache.lookup_batch(&pairs) {
+        Ok(b) => b,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
     let mut grouped: std::collections::HashMap<String, Vec<CardResultEntry>> =
         std::collections::HashMap::new();
 
-    for &si in store_indices {
-        let store = &all_stores[si];
-        for key in &store.cache_keys() {
-            for card_name in cards {
-                if let Ok(CacheLookup::Hit(results)) = cache.lookup(card_name, key) {
-                    for r in results {
-                        grouped.entry(card_name.clone()).or_default().push(r.into());
-                    }
-                }
+    for ((card_name, _key), lookup) in batch {
+        if let CacheLookup::Hit(results) = lookup {
+            for r in results {
+                grouped.entry(card_name.clone()).or_default().push(r.into());
             }
         }
     }
@@ -356,24 +387,25 @@ fn try_serve_from_cache(
     all_stores: &[Box<dyn Store>],
     store_indices: &[usize],
 ) -> Option<std::collections::HashMap<String, Vec<CardResultEntry>>> {
+    let pairs = all_cache_pairs(cards, all_stores, store_indices);
+    let batch = cache.lookup_batch(&pairs).ok()?;
+
     let mut grouped: std::collections::HashMap<String, Vec<CardResultEntry>> =
         std::collections::HashMap::new();
 
-    for &si in store_indices {
-        let store = &all_stores[si];
-        for key in &store.cache_keys() {
-            for card_name in cards {
-                match cache.lookup(card_name, key).ok()? {
-                    CacheLookup::Hit(results) => {
-                        for r in results {
-                            grouped.entry(card_name.clone()).or_default().push(r.into());
-                        }
-                    }
-                    CacheLookup::Skip => {}
-                    _ => {
-                        return None;
-                    }
+    for (_pair, lookup) in batch {
+        match lookup {
+            CacheLookup::Hit(results) => {
+                for r in results {
+                    grouped
+                        .entry(r.card_name.clone())
+                        .or_default()
+                        .push(r.into());
                 }
+            }
+            CacheLookup::Skip => {}
+            CacheLookup::Search => {
+                return None;
             }
         }
     }
@@ -411,9 +443,8 @@ async fn start_fetch(
             .build()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
-        let (resolved, unres) =
-            crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let (resolved, unres) = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         cards = resolved;
         unrecognized = unres;
     }
@@ -463,7 +494,16 @@ async fn start_fetch(
     let cards_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let current = Arc::new(Mutex::new((String::new(), String::new())));
 
-    state.reserve_slot(JobKind::Fetch)?;
+    state
+        .reserve_slot(JobKind::Fetch)
+        .map_err(|(code, msg, ids)| {
+            let body = serde_json::json!({
+                "error": msg,
+                "existing_job_id": ids.first().map(|s| s.as_str()).unwrap_or(""),
+            })
+            .to_string();
+            (code, body)
+        })?;
 
     let job_id = new_job_id();
 
@@ -572,9 +612,8 @@ async fn start_wizard(
             .build()
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
-        let (resolved, unres) =
-            crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
-                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let (resolved, unres) = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         cards = resolved;
         unrecognized = unres;
     }
@@ -678,7 +717,16 @@ async fn start_wizard(
         0
     };
 
-    state.reserve_slot(JobKind::Wizard)?;
+    state
+        .reserve_slot(JobKind::Wizard)
+        .map_err(|(code, msg, ids)| {
+            let body = serde_json::json!({
+                "error": msg,
+                "existing_job_id": ids.first().map(|s| s.as_str()).unwrap_or(""),
+            })
+            .to_string();
+            (code, body)
+        })?;
 
     let job_id = new_job_id();
 

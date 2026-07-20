@@ -3,7 +3,7 @@ use crate::stores::StoreResult;
 use crate::wizard::WizardSolution;
 use anyhow::Context;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -257,6 +257,109 @@ impl Cache {
             }
             _ => Ok(CacheLookup::Search),
         }
+    }
+
+    /// Batch version of `lookup` — checks many (card, store) pairs under a
+    /// single lock with one SQL query.  Drastically reduces lock contention
+    /// compared to calling `lookup` in a loop.
+    ///
+    /// Returns a map from `(card_name, store_key)` → `CacheLookup`, with
+    /// the same semantics as the single-pair `lookup`.
+    pub fn lookup_batch(
+        &self,
+        pairs: &[(String, String)],
+    ) -> anyhow::Result<HashMap<(String, String), CacheLookup>> {
+        if pairs.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let now = epoch_secs();
+
+        // Collect unique card names for the IN clause.
+        let card_names: Vec<&str> = pairs
+            .iter()
+            .map(|(c, _)| c.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let placeholders: Vec<String> = (1..=card_names.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT card_name, store_name, price, url, fetched_at, in_stock \
+             FROM listings WHERE card_name IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = card_names
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
+
+        let rows: Vec<(String, String, u32, String, i64, i64)> = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok((
+                    row.get(0)?, // card_name
+                    row.get(1)?, // store_name
+                    row.get(2)?, // price
+                    row.get(3)?, // url
+                    row.get(4)?, // fetched_at
+                    row.get(5)?, // in_stock
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut result = HashMap::new();
+        for (card_name, key) in pairs {
+            let key_prefix = format!("{}:", key);
+            let matching: Vec<_> = rows
+                .iter()
+                .filter(|(cn, sn, _, _, _, _)| {
+                    cn == card_name && (sn == key || sn.starts_with(&key_prefix))
+                })
+                .collect();
+
+            let lookup = if matching.is_empty() {
+                CacheLookup::Search
+            } else {
+                let max_fetched = matching
+                    .iter()
+                    .map(|(_, _, _, _, ft, _)| *ft)
+                    .max()
+                    .unwrap_or(0);
+                let in_stock_count =
+                    matching.iter().filter(|(_, _, _, _, _, s)| *s == 1).count() as i64;
+                let age = Duration::from_secs((now - max_fetched).max(0) as u64);
+
+                if in_stock_count == 0 {
+                    if age < NEGATIVE_TTL {
+                        CacheLookup::Skip
+                    } else {
+                        CacheLookup::Search
+                    }
+                } else if age >= POSITIVE_TTL {
+                    CacheLookup::Search
+                } else {
+                    let items: Vec<StoreResult> = matching
+                        .iter()
+                        .filter(|(_, _, _, _, _, s)| *s == 1)
+                        .map(|(_, sn, p, u, _, _)| StoreResult {
+                            store_name: sn.clone(),
+                            card_name: card_name.clone(),
+                            price: *p,
+                            url: u.clone(),
+                        })
+                        .collect();
+                    CacheLookup::Hit(items)
+                }
+            };
+
+            result.insert((card_name.clone(), key.clone()), lookup);
+        }
+
+        Ok(result)
     }
 
     /// Store search results (or lack thereof) in the cache.

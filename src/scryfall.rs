@@ -99,25 +99,25 @@ pub fn resolve_with_cache(
         // Check local cache first
         let cached = cache.and_then(|c| c.lookup_scryfall(name).transpose());
 
-        let canonical = match cached {
-            Some(Ok(canonical)) => Some(canonical),
+        let (canonical, hit_api) = match cached {
+            Some(Ok(canonical)) => (Some(canonical), false),
             _ => match resolve_name(client, name) {
                 Ok(Some(canonical)) => {
                     if let Some(c) = cache {
                         let _ = c.store_scryfall(name, &canonical);
                     }
-                    Some(canonical)
+                    (Some(canonical), true)
                 }
                 Ok(None) => {
                     unrecognized.push(name.clone());
-                    None
+                    (None, true)
                 }
                 Err(e) => {
                     eprintln!(
                         "Warning: Scryfall lookup failed for '{}': {} -- using original name.",
                         name, e
                     );
-                    Some(name.clone())
+                    (Some(name.clone()), true)
                 }
             },
         };
@@ -126,7 +126,10 @@ pub fn resolve_with_cache(
             resolved.push(name);
         }
 
-        std::thread::sleep(Duration::from_millis(SCRYFALL_DELAY_MS));
+        // Only sleep when we made a live API call, not on cache hits.
+        if hit_api {
+            std::thread::sleep(Duration::from_millis(SCRYFALL_DELAY_MS));
+        }
     }
 
     resolved.sort();

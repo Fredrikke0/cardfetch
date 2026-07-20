@@ -88,7 +88,7 @@ Behavior depends on `cache_only`:
 | 400 | `"Too many cards: 101. Max is 100."` | Cards exceed limit |
 | 400 | `"No cards provided."` | Empty card list |
 | 400 | `"No recognized Magic card names found after resolution."` | All card names failed Scryfall resolution |
-| 503 | `"Server busy: 1 fetch job(s) already running. …"` | Another fetch job is running (never with `cache_only`). A wizard job does not block fetch. |
+| 503 | `{"error":"Server busy: …","existing_job_id":"XsAcq8nz"}` | Another fetch job is running (never with `cache_only`). The `existing_job_id` lets other users poll the running job's progress. A wizard job does not block fetch. |
 
 ---
 
@@ -175,6 +175,7 @@ Each solution object has the same shape:
 | 400 | `"Tolerance too high: 6. Max is 5."` | Tolerance > 5 |
 | 400 | `"No cached listings found. Run a /fetch first."` | No listings in cache |
 | 400 | `"No recognized Magic card names found after resolution."` | All card names failed Scryfall resolution |
+| 503 | `{"error":"Server busy: …","existing_job_id":"aB3dEfGh"}` | Another wizard job is running. The `existing_job_id` lets other users poll the running job's progress. |
 
 ---
 
@@ -370,7 +371,7 @@ Jobs live in memory only. Restarting the server loses all active and completed j
 ## Error handling checklist
 
 - [x] Server unreachable → show connection error
-- [x] `503` (server busy) → show "Server busy" message + retry button
+- [x] `503` (server busy) → parse `existing_job_id` from the JSON body and poll that job to show progress to other users. Show "Server busy" message + retry button.
 - [x] `400` (too many cards / tolerance too high / no recognized cards) → show validation before submitting
 - [x] `404` on `/jobs/{id}` → show "Job expired" (30min cleanup)
 - [x] `status: "failed"` → show the `error` field
