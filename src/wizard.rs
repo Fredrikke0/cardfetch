@@ -346,6 +346,15 @@ struct MoveInfo {
     new_si: Option<usize>,
 }
 
+/// Arguments for `try_single_move_delta_pre_fast`, bundling the per-move
+/// fields that the caller already has from the outer loop of `best_neighbor`.
+struct FastMove {
+    ci: usize,
+    old_price: u32,
+    old_si: Option<usize>,
+    new_oi: Option<usize>,
+}
+
 /// Values that are constant for the duration of a `best_neighbor` scan.
 /// Computing them once and threading them into `delta_from_info` avoids
 /// redundant `saturating_sub` and multiplication in the inner loop.
@@ -620,24 +629,20 @@ impl ScoredAssignment {
     /// `old_price` and `old_si` from `input.cards[ci].options` — the caller
     /// already has them from the outer loop of `best_neighbor` Move 1.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn try_single_move_delta_pre_fast(
         &self,
-        ci: usize,
-        old_price: u32,
-        old_si: Option<usize>,
-        new_oi: Option<usize>,
+        mv: &FastMove,
         input: &WizardInput,
         config: &WizardConfig,
         pre: &DeltaPrecompute,
     ) -> i64 {
-        let card = &input.cards[ci];
-        let new_price = new_oi.map_or(0, |oi| card.options[oi].price);
-        let new_si = new_oi.map(|oi| card.options[oi].store_idx);
+        let card = &input.cards[mv.ci];
+        let new_price = mv.new_oi.map_or(0, |oi| card.options[oi].price);
+        let new_si = mv.new_oi.map(|oi| card.options[oi].store_idx);
         let info = MoveInfo {
-            old_price,
+            old_price: mv.old_price,
             new_price,
-            old_si,
+            old_si: mv.old_si,
             new_si,
         };
         self.delta_from_info_pre(&info, input, config, pre)
@@ -1490,7 +1495,6 @@ fn initial_assignment(input: &WizardInput, seed: usize) -> Assignment {
 }
 
 /// Greedy set cover: repeatedly pick the store covering the most unassigned cards.
-#[allow(clippy::needless_range_loop)]
 fn initial_simplest(input: &WizardInput, seed: usize) -> Assignment {
     let n = input.card_count();
     let mut assigned = vec![false; n];
@@ -1502,7 +1506,7 @@ fn initial_simplest(input: &WizardInput, seed: usize) -> Assignment {
         let mut best_count = 0;
         let mut candidates: Vec<usize> = Vec::new();
 
-        for si in 0..input.store_names.len() {
+        for (si, _) in input.store_names.iter().enumerate() {
             if picked[si] {
                 continue;
             }
@@ -1587,10 +1591,12 @@ fn best_neighbor(
                 continue;
             }
             let delta = current.try_single_move_delta_pre_fast(
-                ci,
-                old_price,
-                old_si,
-                Some(oi),
+                &FastMove {
+                    ci,
+                    old_price,
+                    old_si,
+                    new_oi: Some(oi),
+                },
                 input,
                 config,
                 &pre,
@@ -1602,8 +1608,17 @@ fn best_neighbor(
         }
 
         if cur.is_some() {
-            let delta = current
-                .try_single_move_delta_pre_fast(ci, old_price, old_si, None, input, config, &pre);
+            let delta = current.try_single_move_delta_pre_fast(
+                &FastMove {
+                    ci,
+                    old_price,
+                    old_si,
+                    new_oi: None,
+                },
+                input,
+                config,
+                &pre,
+            );
             if delta < best_delta {
                 best_delta = delta;
                 best_move = Some((ci, None));
@@ -1612,8 +1627,17 @@ fn best_neighbor(
 
         if cur.is_none() && !card.options.is_empty() {
             // Options are sorted by price, so [0] is the global cheapest.
-            let delta =
-                current.try_single_move_delta_pre_fast(ci, 0, None, Some(0), input, config, &pre);
+            let delta = current.try_single_move_delta_pre_fast(
+                &FastMove {
+                    ci,
+                    old_price: 0,
+                    old_si: None,
+                    new_oi: Some(0),
+                },
+                input,
+                config,
+                &pre,
+            );
             if delta < best_delta {
                 best_delta = delta;
                 best_move = Some((ci, Some(0)));

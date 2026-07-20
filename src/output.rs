@@ -19,14 +19,32 @@ fn abbreviate(name: &str) -> String {
     for tld in &[".no", ".com", ".net", ".org"] {
         if let Some(base) = name.strip_suffix(tld) {
             let mut c = base.chars();
-            let capitalized = match c.next() {
+            return match c.next() {
                 Some(head) => head.to_uppercase().chain(c).collect(),
                 None => String::new(),
             };
-            return capitalized;
         }
     }
     name.to_string()
+}
+
+/// Visible width of `abbreviate(name)` without allocating.
+fn abbreviate_len(name: &str) -> usize {
+    if let Some(seller) = name.strip_prefix("cardmarket-int-private.com:") {
+        return 9 + seller.len(); // "CM-PRIV: "
+    }
+    if let Some(seller) = name.strip_prefix("cardmarket-int.com:") {
+        return 7 + seller.len(); // "CM-INT: "
+    }
+    if let Some(seller) = name.strip_prefix("cardmarket.com:") {
+        return 4 + seller.len(); // "CM: "
+    }
+    for tld in &[".no", ".com", ".net", ".org"] {
+        if let Some(base) = name.strip_suffix(tld) {
+            return base.len();
+        }
+    }
+    name.len()
 }
 
 /// Format a price stored as integer oere to e.g. "15,00 kr".
@@ -187,7 +205,7 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
                 .filter_map(|r| r.cells[i].0.map(|sr| format_price(sr.price as u64).len()))
                 .max()
                 .unwrap_or(1);
-            abbreviate(name).len().max(max_cell).max(1)
+            abbreviate_len(name).max(max_cell).max(1)
         })
         .collect();
 
@@ -214,13 +232,13 @@ fn print_store_table<'a>(cards: &'a [String], grouped: &'a HashMap<&str, Vec<&'a
             match opt {
                 Some(sr) => {
                     let price_str = format_price(sr.price as u64);
-                    let raw = if *is_cheap {
-                        format!("\x1b[32m{}\x1b[0m", price_str)
+                    let linked = hyperlink(&sr.url, &price_str);
+                    let visible = if *is_cheap {
+                        format!("\x1b[32m{}\x1b[0m", linked)
                     } else {
-                        price_str.clone()
+                        linked.clone()
                     };
-                    let linked = hyperlink(&sr.url, &raw);
-                    print_cell(&price_str, &linked, store_widths[i]);
+                    print_cell(&price_str, &visible, store_widths[i]);
                 }
                 None => {
                     print_cell("-", "-", store_widths[i]);

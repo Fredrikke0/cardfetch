@@ -51,10 +51,9 @@ const BLACKLISTED_SELLERS: &[&str] = &[
 
 /// Check if a seller name is on the blacklist (case-insensitive).
 pub(crate) fn is_blacklisted(name: &str) -> bool {
-    let lower = name.to_lowercase();
     BLACKLISTED_SELLERS
         .iter()
-        .any(|b| lower == b.to_lowercase())
+        .any(|b| name.eq_ignore_ascii_case(b))
 }
 
 // ── Seller name extraction ────────────────────────────────────────────────────
@@ -175,13 +174,19 @@ pub(crate) fn shipping_for(store_name: &str) -> ShippingInfo {
             card_limit: 0,
             card_surcharge: 0,
         },
-        _ => ShippingInfo {
-            base: 0,
-            free_threshold: 0,
-            min_order: 0,
-            card_limit: 0,
-            card_surcharge: 0,
-        },
+        _ => {
+            eprintln!(
+                "  Warning: no shipping info for unknown store '{}' — assuming zero",
+                store_name
+            );
+            ShippingInfo {
+                base: 0,
+                free_threshold: 0,
+                min_order: 0,
+                card_limit: 0,
+                card_surcharge: 0,
+            }
+        }
     }
 }
 

@@ -7,7 +7,7 @@ mod stores;
 mod wizard;
 
 use anyhow::Context;
-use cache::{Cache, CacheLookup};
+use cache::{Cache, CacheLookup, SaveWizardParams};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
@@ -49,6 +49,7 @@ struct Cli {
     strategy: Strategy,
 
     /// Maximum number of wanted cards the solution is allowed to skip.
+    /// Capped at one fewer than the total card count (skipping everything is meaningless).
     #[arg(long, default_value = "0")]
     tolerance: usize,
 
@@ -220,8 +221,18 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        // Cap tolerance: skipping every card is never useful.
+        let max_tolerance = unique_cards.len().saturating_sub(1);
+        let effective_tolerance = cli.tolerance.min(max_tolerance);
+        if cli.tolerance > effective_tolerance {
+            eprintln!(
+                "  [wizard] tolerance clamped to {effective_tolerance} (cannot skip all {} cards)",
+                unique_cards.len()
+            );
+        }
+
         // Run optimizer for each tolerance 0..=max.
-        let num_steps = cli.tolerance + 1;
+        let num_steps = effective_tolerance + 1;
         let bar = ProgressBar::new(num_steps as u64).with_style(
             ProgressStyle::with_template(
                 "{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} tolerances",
@@ -276,7 +287,7 @@ fn main() -> anyhow::Result<()> {
 
         let mut solutions: Vec<(usize, wizard::WizardSolution)> = Vec::new();
         let mut search_mode: wizard::SearchMode = wizard::SearchMode::Heuristic { seed: None };
-        for t in 0..=cli.tolerance {
+        for t in 0..=effective_tolerance {
             if let Some(ref candidates) = exhaustive_candidates {
                 search_mode = wizard::SearchMode::Exhaustive {
                     candidates: candidates.clone(),
@@ -353,15 +364,15 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 if is_better {
-                    cache.save_wizard_solution(
-                        strategy_name,
-                        *t,
-                        cli.eu_destination,
-                        cli.exhaustive,
-                        *rank,
-                        cur_sol,
-                        &unique_cards,
-                    )?;
+                    cache.save_wizard_solution(&SaveWizardParams {
+                        strategy: strategy_name,
+                        tolerance: *t,
+                        eu_destination: cli.eu_destination,
+                        was_exhaustive: cli.exhaustive,
+                        rank: *rank,
+                        solution: cur_sol,
+                        card_names: &unique_cards,
+                    })?;
                 }
 
                 // Only add the best per tolerance to the display list.
@@ -384,15 +395,15 @@ fn main() -> anyhow::Result<()> {
                         // strategy, also persist it under the CURRENT strategy
                         // so the inferior current result doesn't survive across runs.
                         if imported_tolerances.contains(t) {
-                            cache.save_wizard_solution(
-                                strategy_name,
-                                *t,
-                                cli.eu_destination,
-                                cli.exhaustive,
-                                1, // rank 1 — this is the best we know
-                                &reconstructed,
-                                &unique_cards,
-                            )?;
+                            cache.save_wizard_solution(&SaveWizardParams {
+                                strategy: strategy_name,
+                                tolerance: *t,
+                                eu_destination: cli.eu_destination,
+                                was_exhaustive: cli.exhaustive,
+                                rank: 1, // rank 1 — this is the best we know
+                                solution: &reconstructed,
+                                card_names: &unique_cards,
+                            })?;
                         }
                         merged.push((*t, reconstructed));
                     }
@@ -517,8 +528,7 @@ fn main() -> anyhow::Result<()> {
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .timeout(timeout)
                 .build()
-                .context("Failed to build per-store HTTP client")
-                .expect("reqwest::Client::build only fails on system config errors (e.g. missing TLS)");
+                .expect("Failed to build per-store HTTP client");
 
             let counts = &store_stats[&store_name];
 

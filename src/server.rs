@@ -1,4 +1,4 @@
-use crate::cache::{Cache, CacheLookup};
+use crate::cache::{Cache, CacheLookup, SaveWizardParams};
 use crate::stores::{self, Store, StoreResult, DELAY_JITTER_MS, DELAY_MS};
 use crate::wizard::{self, Strategy, WizardConfig, WizardSolution};
 use axum::extract::{Path, State};
@@ -754,6 +754,9 @@ async fn start_wizard(
         unrecognized = unres;
     }
 
+    // Cap tolerance: skipping every card produces a useless zero-cost solution.
+    let tolerance = req.tolerance.min(cards.len().saturating_sub(1));
+
     let strategy = match req.strategy.as_str() {
         "simplest" => Strategy::Simplest,
         "cheapest" => Strategy::Cheapest,
@@ -803,7 +806,7 @@ async fn start_wizard(
     // Only use cached solutions if they were computed exhaustively.
     // Non-exhaustive cache entries are stale and will be replaced.
     let cached = cache
-        .get_cached_solutions(strategy_name, req.tolerance, req.eu_destination, &cards)
+        .get_cached_solutions(strategy_name, tolerance, req.eu_destination, &cards)
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -812,14 +815,13 @@ async fn start_wizard(
         })?;
 
     if !cached.is_empty() {
-        let can_use_cache =
-            cached.iter().any(|(_, was_exhaustive)| *was_exhaustive);
+        let can_use_cache = cached.iter().any(|(_, was_exhaustive)| *was_exhaustive);
         if can_use_cache {
             let input =
                 wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
             let config = WizardConfig {
                 strategy,
-                tolerance: req.tolerance,
+                tolerance,
             };
             let solutions: Vec<_> = cached
                 .iter()
@@ -834,7 +836,7 @@ async fn start_wizard(
         }
     }
 
-    let tolerance_total = req.tolerance + 1;
+    let tolerance_total = tolerance + 1;
 
     let input = wizard::WizardInput::from_results_and_wants(listings, &cards, req.eu_destination);
     let candidates = wizard::select_candidate_stores(&input);
@@ -882,7 +884,6 @@ async fn start_wizard(
 
     let job_ref = job.clone();
     let cache_clone = cache.clone();
-    let tolerance = req.tolerance;
     let eu = req.eu_destination;
     let unrecognized_for_job = unrecognized.clone();
 
@@ -990,15 +991,15 @@ async fn start_wizard(
         for (t, sol) in &all_solutions {
             let rank = tol_counter.entry(*t).or_insert(0);
             *rank += 1;
-            let _ = cache_clone.save_wizard_solution(
-                strategy_name,
-                *t,
-                eu,
-                true, // always exhaustive now
-                *rank,
-                sol,
-                &cards,
-            );
+            let _ = cache_clone.save_wizard_solution(&SaveWizardParams {
+                strategy: strategy_name,
+                tolerance: *t,
+                eu_destination: eu,
+                was_exhaustive: true, // always exhaustive now
+                rank: *rank,
+                solution: sol,
+                card_names: &cards,
+            });
         }
 
         // Return all solutions for the max tolerance, best first.
