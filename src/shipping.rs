@@ -46,6 +46,7 @@ const BLACKLISTED_SELLERS: &[&str] = &[
     "The-Archivist",
     "LGRMasterC",
     "ReCollectibles",
+    "ENIGMA-DISTRIBUTION",
 ];
 
 /// Check if a seller name is on the blacklist (case-insensitive).

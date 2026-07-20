@@ -305,7 +305,7 @@ fn main() -> anyhow::Result<()> {
                         seed: Some(seed_choices),
                     };
                 }
-                for (_rank, sol) in results.into_iter().enumerate() {
+                for sol in results.into_iter() {
                     solutions.push((t, sol));
                 }
             }

@@ -331,7 +331,7 @@ impl Store for CardMarket {
         }
         // Serialize and ensure browser session.
         let mut session_guard = self.session.lock().unwrap();
-        let tab = Self::ensure_tab(&mut *session_guard, self.verbose)?;
+        let tab = Self::ensure_tab(&mut session_guard, self.verbose)?;
         let slug = title_to_slug(card_name);
         let results = self.fetch_all_in_one_tab(&tab, card_name, &slug)?;
         let mut all = results.norwegian;
@@ -374,7 +374,7 @@ impl Store for CardMarket {
         let slug = title_to_slug(card_name);
 
         for attempt in 0..2 {
-            let tab = match Self::ensure_tab(&mut *session_guard, self.verbose) {
+            let tab = match Self::ensure_tab(&mut session_guard, self.verbose) {
                 Ok(t) => t,
                 Err(e) => {
                     let msg = e.to_string();

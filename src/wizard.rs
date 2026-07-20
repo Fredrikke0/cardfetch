@@ -1132,6 +1132,10 @@ struct SubsetEvaluator<'a> {
     totals_buf: &'a mut [u64],
     global_mins_sum: u64,
     min_shipping_base: u64,
+    /// Suffix sum of per-card global minima across all candidates.
+    /// global_suffix[ci] = sum_{j=ci}^{n-1} min price for card j.
+    /// Used for early bail in score_store_subset.
+    global_suffix: &'a [u64],
     /// Sorted best scores (ascending), up to TOP_N entries.
     /// Each entry: (subset, choices, score).
     local_best: Vec<(Vec<usize>, Vec<Option<usize>>, u64)>,
@@ -1140,6 +1144,7 @@ struct SubsetEvaluator<'a> {
 }
 
 impl<'a> SubsetEvaluator<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         input: &'a WizardInput,
         config: &'a WizardConfig,
@@ -1147,6 +1152,7 @@ impl<'a> SubsetEvaluator<'a> {
         totals_buf: &'a mut [u64],
         global_mins_sum: u64,
         min_shipping_base: u64,
+        global_suffix: &'a [u64],
         bar: &'a ProgressBar,
     ) -> Self {
         Self {
@@ -1156,6 +1162,7 @@ impl<'a> SubsetEvaluator<'a> {
             totals_buf,
             global_mins_sum,
             min_shipping_base,
+            global_suffix,
             local_best: Vec::with_capacity(TOP_N),
             bar_acc: 0,
             bar,
@@ -1188,13 +1195,18 @@ impl<'a> SubsetEvaluator<'a> {
             return;
         }
 
-        let score = score_store_subset(
+        let score = match score_store_subset(
             self.input,
             self.config,
             subset,
             self.choices_buf,
             self.totals_buf,
-        );
+            self.worst_best_score(),
+            self.global_suffix,
+        ) {
+            Some(s) => s,
+            None => return, // bailed early — can't beat current top N
+        };
 
         // Insert into sorted top-N list.
         let entry = (subset.to_vec(), self.choices_buf.to_vec(), score);
@@ -1216,10 +1228,14 @@ impl<'a> SubsetEvaluator<'a> {
 /// Score a specific store subset: greedily assigns each card to the cheapest
 /// store in the subset that carries it (or skips the card).
 ///
+/// Returns `None` if the partial score mid-assignment already exceeds
+/// `worst_best_score` (early bail).  The caller's `choices_out` / `store_totals_out`
+/// are left in an intermediate state in that case — the caller must discard them.
+///
 /// Writes the resulting option choices into `choices_out` (must be at least
 /// `input.card_count()` elements) and card subtotals into `store_totals_out`
 /// (must be at least `store_subset.len()` elements; the first k entries are
-/// zeroed on entry).  Returns the composite score.
+/// zeroed on entry).  Returns the composite score on success.
 ///
 /// The caller owns the buffers and can reuse them across calls to avoid
 /// per-combination allocations.
@@ -1230,17 +1246,34 @@ fn score_store_subset(
     store_subset: &[usize],
     choices_out: &mut [Option<usize>],
     store_totals_out: &mut [u64],
-) -> u64 {
+    worst_best_score: u64,
+    global_suffix: &[u64],
+) -> Option<u64> {
     let n = input.card_count();
     let k = store_subset.len();
     debug_assert!(choices_out.len() >= n);
     debug_assert!(store_totals_out.len() >= k);
+
+    let k_base = k_base_score(k, config.strategy);
 
     store_totals_out[..k].fill(0);
     // Track card counts per store for shipping tier calculation.
     let mut card_counts = [0usize; 6];
     debug_assert!(k <= 6);
     let mut num_skipped = 0usize;
+    let mut running_card_total: u64 = 0;
+
+    // ── Early-bail helper: check running card total against suffix ───────
+    // Inlined manually in each branch to avoid function-call overhead.
+    // After processing card `ci`, if even free shipping + global-minimum
+    // prices for remaining cards can't beat worst_best_score, bail.
+    macro_rules! check_a {
+        ($ci:expr) => {
+            if running_card_total + global_suffix[$ci + 1] + k_base >= worst_best_score {
+                return None;
+            }
+        };
+    }
 
     // Unrolled fast paths for common k values — avoids loop overhead
     // and enumerate() per card.  option_indices are only read for the
@@ -1276,9 +1309,11 @@ fn score_store_subset(
             if best_price != u32::MAX {
                 store_totals_out[best_pos] += best_price as u64;
                 card_counts[best_pos] += 1;
+                running_card_total += best_price as u64;
             } else {
                 num_skipped += 1;
             }
+            check_a!(ci);
         }
     } else if k == 4 {
         let s0 = store_subset[0];
@@ -1321,9 +1356,11 @@ fn score_store_subset(
             if best_price != u32::MAX {
                 store_totals_out[best_pos] += best_price as u64;
                 card_counts[best_pos] += 1;
+                running_card_total += best_price as u64;
             } else {
                 num_skipped += 1;
             }
+            check_a!(ci);
         }
     } else {
         let n_st = input.store_names.len();
@@ -1344,8 +1381,38 @@ fn score_store_subset(
             if best_price != u32::MAX {
                 store_totals_out[best_pos] += best_price as u64;
                 card_counts[best_pos] += 1;
+                running_card_total += best_price as u64;
             } else {
                 num_skipped += 1;
+            }
+
+            // Check A: every-card O(1) lower bound via global suffix.
+            check_a!(ci);
+
+            // Check B: every 8 cards, compute real partial score.  Assumes
+            // worst case for remaining cards (all skipped).  O(k) but
+            // amortized to ~12% overhead.
+            if ci % 8 == 7 && ci + 1 < n {
+                let partial_card: u64 = store_totals_out[..k].iter().sum();
+                let partial_shipping: u64 = store_subset
+                    .iter()
+                    .zip(store_totals_out[..k].iter())
+                    .zip(card_counts[..k].iter())
+                    .map(|((&si, &total), &count)| input.shipping_cost(si, total, count))
+                    .sum();
+                let stores_used = card_counts[..k].iter().filter(|&&c| c > 0).count();
+                // Worst case: all remaining cards are skipped.
+                let worst_skipped = num_skipped + (n - ci - 1);
+                let partial_score = compute_raw_score(
+                    partial_card + partial_shipping,
+                    stores_used,
+                    worst_skipped,
+                    config.tolerance,
+                    config.strategy,
+                );
+                if partial_score >= worst_best_score {
+                    return None;
+                }
             }
         }
     }
@@ -1359,13 +1426,13 @@ fn score_store_subset(
         .sum();
 
     let num_stores_used = card_counts[..k].iter().filter(|&&c| c > 0).count();
-    compute_raw_score(
+    Some(compute_raw_score(
         card_total + shipping,
         num_stores_used,
         num_skipped,
         config.tolerance,
         config.strategy,
-    )
+    ))
 }
 
 /// Exhaustively search for the optimal store assignment by enumerating
@@ -1431,6 +1498,23 @@ fn optimize_exhaustive(
         .min()
         .unwrap_or(0);
 
+    // Per-card global minima and suffix sum for early bail in score_store_subset.
+    // global_card_min[ci] = cheapest price for card ci among ALL candidates.
+    // global_suffix[ci]   = sum of global_card_min for cards ci..n-1.
+    let global_card_min: Vec<u64> = (0..n)
+        .map(|ci| {
+            candidates
+                .iter()
+                .filter_map(|&si| input.cheapest_at(ci, si).map(|(_, p)| p as u64))
+                .min()
+                .unwrap_or(SKIP_PENALTY) // unavailable → forced skip, penalize
+        })
+        .collect();
+    let mut global_suffix = vec![0u64; n + 1];
+    for ci in (0..n).rev() {
+        global_suffix[ci] = global_suffix[ci + 1] + global_card_min[ci];
+    }
+
     let bar = ProgressBar::new(total_combos).with_style(
         ProgressStyle::with_template(
             "{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {pos}/{len} ({per_sec} combo/s)",
@@ -1457,6 +1541,7 @@ fn optimize_exhaustive(
             const { std::cell::RefCell::new(Vec::new()) };
     }
     // Helper: merge two top-N lists, keeping only the best N entries.
+    #[allow(clippy::type_complexity)]
     fn merge_top_n(
         a: &mut Vec<(Vec<usize>, Vec<Option<usize>>, u64)>,
         b: &mut Vec<(Vec<usize>, Vec<Option<usize>>, u64)>,
@@ -1487,6 +1572,7 @@ fn optimize_exhaustive(
                             &mut totals_buf,
                             global_mins_sum,
                             min_shipping_base,
+                            &global_suffix,
                             &bar,
                         );
 
@@ -1539,6 +1625,7 @@ fn optimize_exhaustive(
                             &mut totals_buf,
                             global_mins_sum,
                             min_shipping_base,
+                            &global_suffix,
                             &bar,
                         );
 
@@ -1594,6 +1681,7 @@ fn optimize_exhaustive(
                             &mut totals_buf,
                             global_mins_sum,
                             min_shipping_base,
+                            &global_suffix,
                             &bar,
                         );
 
@@ -1660,6 +1748,7 @@ fn optimize_exhaustive(
                         &mut totals_buf,
                         global_mins_sum,
                         min_shipping_base,
+                        &global_suffix,
                         &bar,
                     );
                     let mut combo: Vec<usize> = (0..k).collect();

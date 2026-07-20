@@ -492,7 +492,7 @@ fn try_serve_from_cache(
     let batch = cache.lookup_batch(&pairs).ok()?;
 
     // Check: every pair must be cached (Hit or Skip)
-    for (_pair, lookup) in &batch {
+    for lookup in batch.values() {
         if matches!(lookup, CacheLookup::Search) {
             return None;
         }
