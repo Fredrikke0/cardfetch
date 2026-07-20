@@ -118,7 +118,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let started = Instant::now();
-    let input = cli.input.as_ref().unwrap();
+    let input = cli
+        .input
+        .as_ref()
+        .context("--input is required when not running in --server mode")?;
 
     // ── Read cards: --input is either a file path or a card name ──────
     let cards: Vec<String> = {
@@ -162,7 +165,10 @@ fn main() -> anyhow::Result<()> {
             let (resolved, unrecognized) =
                 scryfall::resolve_with_cache(&client, &unique_cards, &Some(&cache))?;
             for name in &unrecognized {
-                eprintln!("Warning: '{}' is not a recognized Magic card -- skipping.", name);
+                eprintln!(
+                    "Warning: '{}' is not a recognized Magic card -- skipping.",
+                    name
+                );
             }
             resolved
         };
@@ -355,7 +361,9 @@ fn main() -> anyhow::Result<()> {
                         merged.push((*t, cur_sol.clone()));
                     } else {
                         // Previous solution is better — reconstruct and display it.
-                        let prev = prev_history.get(t).unwrap();
+                        let prev = prev_history
+                            .get(t)
+                            .expect("prev_history must contain entry for tolerance t when is_better is false");
                         let config = WizardConfig {
                             strategy: cli.strategy,
                             tolerance: *t,
@@ -421,7 +429,10 @@ fn main() -> anyhow::Result<()> {
         let (resolved, unrecognized) =
             scryfall::resolve_with_cache(&client, &unique_cards, &cache_ref)?;
         for name in &unrecognized {
-            eprintln!("Warning: '{}' is not a recognized Magic card -- skipping.", name);
+            eprintln!(
+                "Warning: '{}' is not a recognized Magic card -- skipping.",
+                name
+            );
         }
         resolved
     };
@@ -482,7 +493,8 @@ fn main() -> anyhow::Result<()> {
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .timeout(timeout)
                 .build()
-                .expect("Failed to build per-store HTTP client");
+                .context("Failed to build per-store HTTP client")
+                .expect("reqwest::Client::build only fails on system config errors (e.g. missing TLS)");
 
             let counts = &store_stats[&store_name];
 

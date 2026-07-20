@@ -472,7 +472,9 @@ pub fn print_wizard_summary(
     println!();
 
     // ── Detailed breakdown for max tolerance ────────────────────────────
-    let (max_t, max_sol) = solutions.last().unwrap();
+    let Some((max_t, max_sol)) = solutions.last() else {
+        return;
+    };
     print_wizard_table(max_sol, strategy, *max_t);
 }
 

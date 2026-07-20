@@ -121,8 +121,7 @@ pub(crate) fn rescue_js_snippet() -> &'static str {
 /// Wrapped in `Mutex<Option<...>>` so it can be lazily created and recreated
 /// if the browser dies while idle in long-running server mode.
 struct BrowserSession {
-    #[allow(dead_code)]
-    browser: Browser,
+    _browser: Browser,
     tab: Arc<headless_chrome::Tab>,
     xvfb: Option<std::process::Child>,
 }
@@ -212,7 +211,7 @@ impl CardMarket {
         }
 
         Ok(BrowserSession {
-            browser,
+            _browser: browser,
             tab,
             xvfb: xvfb_child,
         })

@@ -43,42 +43,6 @@ pub fn resolve_name(
     Ok(body.data.into_iter().next())
 }
 
-/// Resolve multiple card names, sleeping between requests to respect the
-/// Scryfall rate limit.  Returns a list of `(original, resolved)` pairs
-/// and a list of names that could not be resolved.
-#[allow(dead_code)]
-pub fn resolve_batch(
-    client: &reqwest::blocking::Client,
-    names: &[String],
-) -> (Vec<(String, String)>, Vec<String>) {
-    let mut resolved: Vec<(String, String)> = Vec::new();
-    let mut unresolved: Vec<String> = Vec::new();
-
-    for name in names {
-        match resolve_name(client, name) {
-            Ok(Some(canonical)) => {
-                resolved.push((name.clone(), canonical));
-            }
-            Ok(None) => {
-                unresolved.push(name.clone());
-            }
-            Err(e) => {
-                eprintln!("Warning: Scryfall lookup failed for '{}': {}", name, e);
-                // Don't treat network errors as unresolvable -- keep the
-                // original name rather than skipping the card entirely.
-                resolved.push((name.clone(), name.clone()));
-            }
-        }
-
-        // Respect rate limit between requests.
-        if names.len() > 1 {
-            std::thread::sleep(Duration::from_millis(SCRYFALL_DELAY_MS));
-        }
-    }
-
-    (resolved, unresolved)
-}
-
 /// Resolve card names via Scryfall with local SQLite caching.
 ///
 /// Checks `cache.lookup_scryfall()` first, falls back to live API calls,

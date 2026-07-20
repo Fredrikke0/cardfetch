@@ -22,6 +22,11 @@ pub struct FetchRequest {
     /// The response may be incomplete (some stores not yet fetched).
     #[serde(default)]
     pub cache_only: bool,
+    /// Max results per store endpoint per card. 0 = no cap (default).
+    /// Applied at response time only — scraping always fetches everything
+    /// so the wizard has full data.
+    #[serde(default)]
+    pub max_per_store: usize,
 }
 
 #[derive(Deserialize)]
@@ -43,32 +48,63 @@ fn default_strategy() -> String {
 
 // ── Response types ───────────────────────────────────────────────────────────
 
+/// Normalize a CardMarket store name: returns (seller_name, category)
+/// where category is "n" (Norwegian), "i" (int powerseller), "p" (int private),
+/// or None for non-CardMarket stores.
+fn split_cm_store(store_name: &str) -> (&str, Option<&'static str>) {
+    if let Some(seller) = store_name.strip_prefix("cardmarket-int-private.com: ") {
+        (seller, Some("p"))
+    } else if let Some(seller) = store_name.strip_prefix("cardmarket-int.com: ") {
+        (seller, Some("i"))
+    } else if let Some(seller) = store_name.strip_prefix("cardmarket.com: ") {
+        (seller, Some("n"))
+    } else {
+        (store_name, None)
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub struct CardResultEntry {
+    /// Store identifier -- seller name for CardMarket, domain for storefronts.
+    #[serde(rename = "s")]
     pub store: String,
+    /// Price in integer oere.
+    #[serde(rename = "p")]
     pub price: u32,
+    /// Full URL to the listing.
+    #[serde(rename = "u")]
     pub url: String,
+    /// CardMarket category: "n" (Norwegian), "i" (int powerseller), "p" (int private).
+    /// Absent for non-CardMarket stores.
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+    pub category: Option<&'static str>,
 }
 
 impl From<StoreResult> for CardResultEntry {
     fn from(r: StoreResult) -> Self {
+        let (store, category) = split_cm_store(&r.store_name);
         Self {
-            store: r.store_name,
+            store: store.to_string(),
             price: r.price,
             url: r.url,
+            category,
         }
     }
 }
 
 #[derive(Serialize, Clone)]
 pub struct FetchResultData {
+    #[serde(rename = "r")]
     pub results: HashMap<String, Vec<CardResultEntry>>,
+    #[serde(rename = "u")]
     pub unrecognized: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct WizardResultData {
+    #[serde(rename = "r")]
     pub results: Vec<WizardResponseData>,
+    #[serde(rename = "u")]
     pub unrecognized: Vec<String>,
 }
 
@@ -81,27 +117,44 @@ pub enum JobResult {
 
 #[derive(Serialize, Clone)]
 pub struct WizardResponseData {
+    #[serde(rename = "a")]
     pub assignments: Vec<WizardCardAssignment>,
+    #[serde(rename = "sk")]
     pub skipped: Vec<String>,
+    #[serde(rename = "st")]
     pub stores: Vec<WizardStoreSummary>,
+    #[serde(rename = "tc")]
     pub total_card_cost: u64,
+    #[serde(rename = "ts")]
     pub total_shipping: u64,
+    #[serde(rename = "ns")]
     pub num_stores: usize,
 }
 
 #[derive(Serialize, Clone)]
 pub struct WizardCardAssignment {
+    #[serde(rename = "c")]
     pub card: String,
+    #[serde(rename = "s", skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    #[serde(rename = "p", skip_serializing_if = "Option::is_none")]
     pub price: Option<u32>,
+    #[serde(rename = "u", skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(rename = "t", skip_serializing_if = "Option::is_none")]
+    pub category: Option<&'static str>,
 }
 
 #[derive(Serialize, Clone)]
 pub struct WizardStoreSummary {
+    #[serde(rename = "n")]
     pub name: String,
+    #[serde(rename = "ct")]
     pub card_total: u32,
+    #[serde(rename = "sh")]
     pub shipping: u32,
+    #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+    pub category: Option<&'static str>,
 }
 
 impl WizardResponseData {
@@ -110,11 +163,21 @@ impl WizardResponseData {
             assignments: sol
                 .assignments
                 .iter()
-                .map(|(card, a)| WizardCardAssignment {
-                    card: card.clone(),
-                    store: a.as_ref().map(|s| s.0.clone()),
-                    price: a.as_ref().map(|s| s.1),
-                    url: a.as_ref().map(|s| s.2.clone()),
+                .map(|(card, a)| {
+                    let (store, category) = match a {
+                        Some((name, _price, _url)) => {
+                            let (s, c) = split_cm_store(name);
+                            (Some(s.to_string()), c)
+                        }
+                        None => (None, None),
+                    };
+                    WizardCardAssignment {
+                        card: card.clone(),
+                        store,
+                        price: a.as_ref().map(|s| s.1),
+                        url: a.as_ref().map(|s| s.2.clone()),
+                        category,
+                    }
                 })
                 .collect(),
             skipped: sol.skipped.clone(),
@@ -122,10 +185,14 @@ impl WizardResponseData {
                 .store_names
                 .iter()
                 .enumerate()
-                .map(|(i, name)| WizardStoreSummary {
-                    name: name.clone(),
-                    card_total: sol.card_subtotals[i],
-                    shipping: sol.shipping_costs[i],
+                .map(|(i, name)| {
+                    let (store_name, category) = split_cm_store(name);
+                    WizardStoreSummary {
+                        name: store_name.to_string(),
+                        card_total: sol.card_subtotals[i],
+                        shipping: sol.shipping_costs[i],
+                        category,
+                    }
                 })
                 .collect(),
             total_card_cost: sol.total_card_cost,
@@ -351,6 +418,21 @@ fn all_cache_pairs(
     pairs
 }
 
+/// Extract the cache key from a store name for per-store capping.
+/// CardMarket sub-stores collapse to their base prefix while
+/// other stores use the full name.
+fn store_cache_key(store_name: &str) -> &str {
+    if store_name.starts_with("cardmarket-int-private.com") {
+        "cardmarket-int-private.com"
+    } else if store_name.starts_with("cardmarket-int.com") {
+        "cardmarket-int.com"
+    } else if store_name.starts_with("cardmarket.com") {
+        "cardmarket.com"
+    } else {
+        store_name
+    }
+}
+
 /// Always returns cached results, skipping any entries that aren't cached.
 /// Used by `cache_only` mode — never returns None.
 fn serve_cache_partial(
@@ -358,6 +440,7 @@ fn serve_cache_partial(
     cards: &[String],
     all_stores: &[Box<dyn Store>],
     store_indices: &[usize],
+    max_per_store: usize,
 ) -> std::collections::HashMap<String, Vec<CardResultEntry>> {
     let pairs = all_cache_pairs(cards, all_stores, store_indices);
     let batch = match cache.lookup_batch(&pairs) {
@@ -365,15 +448,32 @@ fn serve_cache_partial(
         Err(_) => return std::collections::HashMap::new(),
     };
 
+    // Group by (card, cache_key) so we can cap per store endpoint
+    let mut per_key: std::collections::HashMap<(String, String), Vec<CardResultEntry>> =
+        std::collections::HashMap::new();
+    for ((card_name, key), lookup) in batch {
+        if let CacheLookup::Hit(results) = lookup {
+            let entries: Vec<CardResultEntry> = results.into_iter().map(|r| r.into()).collect();
+            per_key
+                .entry((card_name.clone(), key))
+                .or_default()
+                .extend(entries);
+        }
+    }
+
+    // Apply per-store cap (0 = no cap)
+    if max_per_store > 0 {
+        for entries in per_key.values_mut() {
+            entries.sort_by_key(|e| e.price);
+            entries.truncate(max_per_store);
+        }
+    }
+
+    // Flatten to card-name keyed map
     let mut grouped: std::collections::HashMap<String, Vec<CardResultEntry>> =
         std::collections::HashMap::new();
-
-    for ((card_name, _key), lookup) in batch {
-        if let CacheLookup::Hit(results) = lookup {
-            for r in results {
-                grouped.entry(card_name.clone()).or_default().push(r.into());
-            }
-        }
+    for ((card_name, _key), entries) in per_key {
+        grouped.entry(card_name).or_default().extend(entries);
     }
 
     grouped
@@ -386,28 +486,41 @@ fn try_serve_from_cache(
     cards: &[String],
     all_stores: &[Box<dyn Store>],
     store_indices: &[usize],
+    max_per_store: usize,
 ) -> Option<std::collections::HashMap<String, Vec<CardResultEntry>>> {
     let pairs = all_cache_pairs(cards, all_stores, store_indices);
     let batch = cache.lookup_batch(&pairs).ok()?;
 
+    // Check: every pair must be cached (Hit or Skip)
+    for (_pair, lookup) in &batch {
+        if matches!(lookup, CacheLookup::Search) {
+            return None;
+        }
+    }
+
+    // Group by (card, cache_key) so we can cap per store endpoint
+    let mut per_key: std::collections::HashMap<(String, String), Vec<CardResultEntry>> =
+        std::collections::HashMap::new();
+    for ((card_name, key), lookup) in batch {
+        if let CacheLookup::Hit(results) = lookup {
+            let entries: Vec<CardResultEntry> = results.into_iter().map(|r| r.into()).collect();
+            per_key.entry((card_name, key)).or_default().extend(entries);
+        }
+    }
+
+    // Apply per-store cap (0 = no cap)
+    if max_per_store > 0 {
+        for entries in per_key.values_mut() {
+            entries.sort_by_key(|e| e.price);
+            entries.truncate(max_per_store);
+        }
+    }
+
+    // Flatten to card-name keyed map
     let mut grouped: std::collections::HashMap<String, Vec<CardResultEntry>> =
         std::collections::HashMap::new();
-
-    for (_pair, lookup) in batch {
-        match lookup {
-            CacheLookup::Hit(results) => {
-                for r in results {
-                    grouped
-                        .entry(r.card_name.clone())
-                        .or_default()
-                        .push(r.into());
-                }
-            }
-            CacheLookup::Skip => {}
-            CacheLookup::Search => {
-                return None;
-            }
-        }
+    for ((card_name, _key), entries) in per_key {
+        grouped.entry(card_name).or_default().extend(entries);
     }
 
     Some(grouped)
@@ -471,21 +584,23 @@ async fn start_fetch(
         let results = state
             .cache
             .as_ref()
-            .map(|c| serve_cache_partial(c, &cards, &state.stores, &stores))
+            .map(|c| serve_cache_partial(c, &cards, &state.stores, &stores, req.max_per_store))
             .unwrap_or_default();
         return Ok(Json(serde_json::json!({
-            "results": results,
-            "unrecognized": unrecognized,
+            "r": results,
+            "u": unrecognized,
         })));
     }
 
     // If we have a cache, check whether everything is already cached.
     // If so, return results immediately — no job needed.
     if let Some(ref cache) = state.cache {
-        if let Some(results) = try_serve_from_cache(cache, &cards, &state.stores, &stores) {
+        if let Some(results) =
+            try_serve_from_cache(cache, &cards, &state.stores, &stores, req.max_per_store)
+        {
             return Ok(Json(serde_json::json!({
-                "results": results,
-                "unrecognized": unrecognized,
+                "r": results,
+                "u": unrecognized,
             })));
         }
     }
@@ -539,6 +654,7 @@ async fn start_fetch(
     let cards_done = cards_done.clone();
     let current = current.clone();
     let unrecognized_for_job = unrecognized.clone();
+    let max_per_store = req.max_per_store;
 
     std::thread::spawn(move || {
         {
@@ -555,13 +671,28 @@ async fn start_fetch(
             current,
         );
 
-        // Group results by card
-        let mut grouped: HashMap<String, Vec<CardResultEntry>> = HashMap::new();
+        // Group results by (card, cache_key) so we can cap per store endpoint
+        let mut per_key: HashMap<(String, String), Vec<CardResultEntry>> = HashMap::new();
         for r in result {
-            grouped
-                .entry(r.card_name.clone())
+            let key = store_cache_key(&r.store_name);
+            per_key
+                .entry((r.card_name.clone(), key.to_string()))
                 .or_default()
                 .push(r.into());
+        }
+
+        // Apply per-store cap (0 = no cap)
+        if max_per_store > 0 {
+            for entries in per_key.values_mut() {
+                entries.sort_by_key(|e| e.price);
+                entries.truncate(max_per_store);
+            }
+        }
+
+        // Flatten to card-name keyed map
+        let mut grouped: HashMap<String, Vec<CardResultEntry>> = HashMap::new();
+        for ((card_name, _key), entries) in per_key {
+            grouped.entry(card_name).or_default().extend(entries);
         }
 
         let mut j = job_ref.lock().unwrap();
@@ -699,8 +830,8 @@ async fn start_wizard(
                 })
                 .collect();
             return Ok(Json(serde_json::json!({
-                "results": WizardResponseData::from_solutions(&solutions),
-                "unrecognized": unrecognized,
+                "r": WizardResponseData::from_solutions(&solutions),
+                "u": unrecognized,
             })));
         }
         // Cache was non-exhaustive but request is exhaustive — fall through to compute.

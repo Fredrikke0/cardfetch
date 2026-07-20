@@ -10,6 +10,26 @@ All endpoints return JSON. The server only listens on `127.0.0.1` — no network
 
 ---
 
+## Data model: store identifiers
+
+Store entries use compact field names. The `s` field is the **store identifier**
+and the optional `c` field is the **CardMarket category**:
+
+| `c` value | CardMarket type | Full store name |
+|---|---|---|
+| `"n"` | Norwegian seller | `cardmarket.com: {s}` |
+| `"i"` | International powerseller | `cardmarket-int.com: {s}` |
+| `"p"` | International private seller | `cardmarket-int-private.com: {s}` |
+| _(absent)_ | Not CardMarket | Use `s` as-is (e.g. `"outland.no"`) |
+
+**Example:**
+```json
+{"s": "AbyssalGames", "p": 220, "u": "https://…", "c": "i"}
+{"s": "outland.no",    "p": 500, "u": "https://…"}
+```
+
+---
+
 ## Endpoints
 
 ### `GET /stores`
@@ -37,7 +57,7 @@ Returns the list of available store names.
 Submits a card search. Card names are resolved to canonical names via the
 [Scryfall autocomplete API](https://scryfall.com/docs/api/cards/autocomplete)
 before searching stores (e.g. `"Lightning"` → `"Lightning Bolt"`).
-Names that cannot be resolved are returned in the `unrecognized` field.
+Names that cannot be resolved are returned in the `u` field.
 
 Behavior depends on `cache_only`:
 
@@ -52,7 +72,8 @@ Behavior depends on `cache_only`:
 {
   "cards": ["Lightning Bolt", "Counterspell"],
   "stores": ["outland", "cardmarket"],
-  "cache_only": false
+  "cache_only": false,
+  "max_per_store": 0
 }
 ```
 
@@ -61,18 +82,33 @@ Behavior depends on `cache_only`:
 | `cards` | `string[]` | — | Max 100 unique cards. Duplicates are ignored. |
 | `stores` | `string[]` | `[]` | Substring match against store names. Empty = all stores. |
 | `cache_only` | `boolean` | `false` | If true, only return cached data — never blocks. |
+| `max_per_store` | `number` | `0` | Max results per store endpoint per card. `0` = no cap. Applied at response time — scraping always fetches everything. |
 
 **Response (all cached, or `cache_only: true`):**
 ```json
 {
-  "results": {
+  "r": {
     "Lightning Bolt": [
-      { "store": "outland.no", "price": 200, "url": "https://…" }
+      {"s": "outland.no", "p": 200, "u": "https://…"}
     ]
   },
-  "unrecognized": []
+  "u": []
 }
 ```
+
+| Field | Type | Notes |
+|---|---|---|
+| `r` | `object` | Card name → array of store entries. |
+| `u` | `string[]` | Card names that Scryfall could not resolve. |
+
+**Store entry fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `s` | `string` | Store identifier (see [Data model](#data-model-store-identifiers)). |
+| `p` | `number` | Price in integer øre. Divide by 100 to display. |
+| `u` | `string` | Full URL to the listing. |
+| `c` | `string?` | CardMarket category: `"n"`, `"i"`, or `"p"`. Absent for non-CM stores. |
 
 **Response (some uncached — background job):**
 ```json
@@ -97,8 +133,8 @@ Behavior depends on `cache_only`:
 Finds the optimal store assignments from previously fetched (cached) card listings.
 Like `/fetch`, card names are resolved via Scryfall before lookup.
 
-Returns a response with `results` (array of up to **3 solutions**, sorted best-first)
-and `unrecognized` (names that couldn't be resolved). Exhaustive mode always returns
+Returns a response with `r` (array of up to **3 solutions**, sorted best-first)
+and `u` (names that couldn't be resolved). Exhaustive mode always returns
 up to 3 alternatives (different store combinations with similar cost); heuristic mode
 returns 1.
 
@@ -132,34 +168,58 @@ current request is exhaustive.
 **Response (cached solution hit — no job):**
 ```json
 {
-  "results": [
+  "r": [
     {
-      "assignments": [
-        { "card": "Lightning Bolt", "store": "outland.no", "price": 200, "url": "https://…" }
+      "a": [
+        {"c": "Lightning Bolt", "s": "outland.no", "p": 200, "u": "https://…"},
+        {"c": "Counterspell"}
       ],
-      "skipped": ["Counterspell"],
-      "stores": [{ "name": "outland.no", "card_total": 200, "shipping": 2900 }],
-      "total_card_cost": 200,
-      "total_shipping": 2900,
-      "num_stores": 1
+      "sk": ["Counterspell"],
+      "st": [
+        {"n": "outland.no", "ct": 200, "sh": 2900}
+      ],
+      "tc": 200,
+      "ts": 2900,
+      "ns": 1
     }
   ],
-  "unrecognized": []
+  "u": []
 }
 ```
 
-The `results` array contains up to **3 solutions**, sorted best-first (lowest internal score).
+The `r` array contains up to **3 solutions**, sorted best-first (lowest internal score).
 Exhaustive mode always returns up to 3 alternatives; heuristic mode returns 1.
 Each solution object has the same shape:
 
 | Field | Type | Notes |
 |---|---|---|
-| `assignments` | `object[]` | One per card. `store`/`price`/`url` are `null` if skipped. |
-| `skipped` | `string[]` | Card names that couldn't be assigned within tolerance. |
-| `stores` | `object[]` | Stores used. `card_total` and `shipping` are in integer øre. |
-| `total_card_cost` | `number` | Sum of assigned card prices (øre). |
-| `total_shipping` | `number` | Sum of shipping costs (øre). |
-| `num_stores` | `number` | Number of distinct stores used. |
+| `a` | `object[]` | Assignments, one per card. See below for entry fields. |
+| `sk` | `string[]` | Card names that couldn't be assigned within tolerance. |
+| `st` | `object[]` | Stores used. See below for entry fields. |
+| `tc` | `number` | Sum of assigned card prices (øre). |
+| `ts` | `number` | Sum of shipping costs (øre). |
+| `ns` | `number` | Number of distinct stores used. |
+
+**Assignment entry (`a[i]`):**
+
+| Field | Type | Notes |
+|---|---|---|
+| `c` | `string` | Card name. |
+| `s` | `string?` | Store identifier (see [Data model](#data-model-store-identifiers)). `null`/absent if skipped. |
+| `p` | `number?` | Price in øre. `null`/absent if skipped. |
+| `u` | `string?` | Listing URL. `null`/absent if skipped. |
+| `t` | `string?` | CardMarket category (`"n"`/`"i"`/`"p"`). Absent for non-CM or skipped cards. |
+
+Skipped cards have only the `c` field — all other fields are omitted.
+
+**Store summary entry (`st[i]`):**
+
+| Field | Type | Notes |
+|---|---|---|
+| `n` | `string` | Store identifier (see [Data model](#data-model-store-identifiers)). |
+| `ct` | `number` | Card subtotal for this store (øre). |
+| `sh` | `number` | Shipping cost for this store (øre). |
+| `c` | `string?` | CardMarket category (`"n"`/`"i"`/`"p"`). Absent for non-CM stores. |
 
 **Response (cache miss — background job):**
 ```json
@@ -248,7 +308,7 @@ frontend knows which progress fields to display.
 | `tolerance_total` | wizard | Total tolerance levels to try |
 | `combos_done` | wizard | Store combinations evaluated (exhaustive only) |
 | `combos_total` | wizard | Total store combinations to evaluate (exhaustive only; 0 for heuristic) |
-| `result` | both | Final result object (only when `"done"`) |
+| `result` | both | Final result object (only when `"done"`) — matches the `/fetch` or `/wizard` response format |
 | `error` | both | Error message (only when `"failed"`) |
 
 **Done response (fetch):**
@@ -265,16 +325,16 @@ frontend knows which progress fields to display.
   "combos_done": 0,
   "combos_total": 0,
   "result": {
-    "results": {
+    "r": {
       "Lightning Bolt": [
-        { "store": "outland.no",    "price": 200, "url": "https://…" },
-        { "store": "cardmarket.com", "price": 350, "url": "https://…" }
+        {"s": "outland.no", "p": 200, "u": "https://…"},
+        {"s": "SellerX",    "p": 350, "u": "https://…", "c": "n"}
       ],
       "Counterspell": [
-        { "store": "cardmarket.com", "price": 120, "url": "https://…" }
+        {"s": "SellerY", "p": 120, "u": "https://…", "c": "i"}
       ]
     },
-    "unrecognized": []
+    "u": []
   }
 }
 ```
@@ -293,27 +353,27 @@ frontend knows which progress fields to display.
   "combos_done": 2048,
   "combos_total": 2048,
   "result": {
-    "results": [
+    "r": [
       {
-        "assignments": [
-          { "card": "Lightning Bolt", "store": "outland.no",    "price": 200, "url": "https://…" },
-          { "card": "Counterspell",   "store": null,             "price": null, "url": null }
+        "a": [
+          {"c": "Lightning Bolt", "s": "outland.no", "p": 200, "u": "https://…"},
+          {"c": "Counterspell"}
         ],
-        "skipped": ["Counterspell"],
-        "stores": [
-          { "name": "outland.no", "card_total": 200, "shipping": 2900 }
+        "sk": ["Counterspell"],
+        "st": [
+          {"n": "outland.no", "ct": 200, "sh": 2900}
         ],
-        "total_card_cost": 200,
-        "total_shipping": 2900,
-        "num_stores": 1
+        "tc": 200,
+        "ts": 2900,
+        "ns": 1
       }
     ],
-    "unrecognized": []
+    "u": []
   }
 }
 ```
 
-The `result.results` array contains up to **3 solutions**, sorted best-first.
+The `result.r` array contains up to **3 solutions**, sorted best-first.
 Exhaustive mode always returns up to 3 alternatives; heuristic mode returns 1.
 
 **Failed response:**
@@ -338,7 +398,7 @@ Exhaustive mode always returns up to 3 alternatives; heuristic mode returns 1.
 |---|---|---|
 | 404 | `"Job 'abc123' not found."` | Invalid or expired job ID |
 
-All prices are in **integer øre** (NOK cents) or euro cents. Divide by 100 to display.
+All prices are in **integer øre** (NOK cents). Divide by 100 to display.
 
 ---
 
@@ -368,6 +428,21 @@ Jobs live in memory only. Restarting the server loses all active and completed j
 
 ---
 
+## Displaying store names
+
+To reconstruct human-readable store names from the compact format:
+
+```
+function storeLabel(entry) {
+  if (entry.c === "n") return `CM: ${entry.s}`;
+  if (entry.c === "i") return `CM-INT: ${entry.s}`;
+  if (entry.c === "p") return `CM-PRIV: ${entry.s}`;
+  return entry.s;  // "outland.no", "finn.no", etc.
+}
+```
+
+---
+
 ## Error handling checklist
 
 - [x] Server unreachable → show connection error
@@ -376,4 +451,4 @@ Jobs live in memory only. Restarting the server loses all active and completed j
 - [x] `404` on `/jobs/{id}` → show "Job expired" (30min cleanup)
 - [x] `status: "failed"` → show the `error` field
 - [x] Network timeout during poll → don't crash, just try next interval
-- [x] `unrecognized` field in response → show warnings for misspelled/invalid card names
+- [x] `u` field in response → show warnings for misspelled/invalid card names
