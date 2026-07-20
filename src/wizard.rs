@@ -134,6 +134,13 @@ impl WizardInput {
         for r in &results {
             let si = store_idx[&r.store_name];
             let mut price = r.price;
+
+            // Skip results with no price (e.g. Finn listings that don't
+            // specify a price — they default to 0).
+            if price == 0 {
+                continue;
+            }
+
             // If EU destination, strip 25% VAT from international seller prices.
             if eu_destination
                 && (r.store_name.starts_with("cardmarket-int.com:")

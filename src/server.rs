@@ -390,6 +390,18 @@ async fn start_fetch(
         ));
     }
 
+    // Resolve partial/ambiguous card names via Scryfall autocomplete.
+    {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("CardFetch/0.1")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
+        cards = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    }
+
     // Determine which store indices are active.
     let stores: Vec<usize> = state
         .stores
@@ -525,6 +537,18 @@ async fn start_wizard(
             StatusCode::BAD_REQUEST,
             format!("Tolerance too high: {}. Max is 5.", req.tolerance),
         ));
+    }
+
+    // Resolve card names via Scryfall so they match the /fetch cache keys.
+    {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("CardFetch/0.1")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
+        cards = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     }
 
     let strategy = match req.strategy.as_str() {

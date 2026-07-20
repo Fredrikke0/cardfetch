@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NEGATIVE_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours
 const POSITIVE_TTL: Duration = Duration::from_secs(7 * 24 * 3600); // 7 days
+const SCRYFALL_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours (per Scryfall recommendation)
 
 /// Result of a cache lookup for a single (card, store) pair.
 pub enum CacheLookup {
@@ -92,9 +93,15 @@ impl Cache {
                             UNIQUE(strategy, tolerance, eu_destination, rank)
                         );
             CREATE INDEX IF NOT EXISTS idx_wizard_solutions_strat
-                ON wizard_solutions(strategy, tolerance);",
+                ON wizard_solutions(strategy, tolerance);
+
+            CREATE TABLE IF NOT EXISTS scryfall_names (
+                input_name    TEXT PRIMARY KEY,
+                resolved_name TEXT NOT NULL,
+                fetched_at    INTEGER NOT NULL
+            );",
         )
-        .context("Failed to create wizard_solutions table")?;
+        .context("Failed to create tables")?;
 
         // Migration: add assignments_json column if upgrading from older schema.
         {
@@ -553,6 +560,47 @@ impl Cache {
             .collect();
 
         Ok(rows)
+    }
+
+    /// Look up a card name in the Scryfall resolution cache.
+    /// Returns `Some("Canonical Name")` if a fresh entry exists, `None` if
+    /// the cache is missing or stale.
+    pub fn lookup_scryfall(&self, input_name: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let now = epoch_secs();
+
+        let row = conn.query_row(
+            "SELECT resolved_name, fetched_at FROM scryfall_names WHERE input_name = ?1",
+            rusqlite::params![input_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let row = optional(row)?;
+
+        match row {
+            Some((resolved, fetched_at)) => {
+                let age = Duration::from_secs((now - fetched_at).max(0) as u64);
+                if age < SCRYFALL_TTL {
+                    Ok(Some(resolved))
+                } else {
+                    Ok(None)
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Store a Scryfall name resolution in the cache.
+    pub fn store_scryfall(&self, input_name: &str, resolved_name: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = epoch_secs();
+
+        conn.execute(
+            "INSERT OR REPLACE INTO scryfall_names (input_name, resolved_name, fetched_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![input_name, resolved_name, now],
+        )?;
+
+        Ok(())
     }
 }
 

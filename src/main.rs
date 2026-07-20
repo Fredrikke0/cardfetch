@@ -1,10 +1,12 @@
 mod cache;
 mod output;
+mod scryfall;
 mod server;
 mod shipping;
 mod stores;
 mod wizard;
 
+use anyhow::Context;
 use cache::{Cache, CacheLookup};
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -149,6 +151,17 @@ fn main() -> anyhow::Result<()> {
     // ── Wizard mode: run from cache ─────────────────────────────────────────
     if cli.wizard {
         let cache = Cache::open("cache.db")?;
+
+        // Resolve card names via Scryfall before looking up listings.
+        let unique_cards = {
+            let client = reqwest::blocking::Client::builder()
+                .user_agent("CardFetch/0.1")
+                .timeout(Duration::from_secs(10))
+                .build()
+                .context("Failed to build Scryfall HTTP client")?;
+            scryfall::resolve_with_cache(&client, &unique_cards, &Some(&cache))?
+        };
+
         let listings = cache.get_listings(&unique_cards)?;
 
         if listings.is_empty() {
@@ -384,7 +397,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     let num_stores = stores_list.len();
-    let num_cards = unique_cards.len();
 
     // Open cache (unless --no-cache)
     let cache: Option<Arc<Cache>> = if cli.no_cache {
@@ -392,6 +404,19 @@ fn main() -> anyhow::Result<()> {
     } else {
         Some(Arc::new(Cache::open("cache.db")?))
     };
+
+    // Resolve card names via Scryfall autocomplete before searching stores.
+    let unique_cards = {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("CardFetch/0.1")
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("Failed to build Scryfall HTTP client")?;
+        let cache_ref: Option<&Cache> = cache.as_ref().map(|c| c.as_ref());
+        scryfall::resolve_with_cache(&client, &unique_cards, &cache_ref)?
+    };
+
+    let num_cards = unique_cards.len();
 
     // Per-card completion tracking: counts how many stores have finished each card
     let card_counts: Arc<Vec<AtomicUsize>> =

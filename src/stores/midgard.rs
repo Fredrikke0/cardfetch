@@ -30,21 +30,63 @@ impl Store for Midgard {
     ) -> anyhow::Result<Vec<StoreResult>> {
         let all_products = fetch_search_results(client, card_name)?;
 
-        // Return all in-stock products matching the card name, so the wizard
-        // can pick the cheapest variant.
-        let matching: Vec<_> = all_products
-            .into_iter()
-            .filter(|p| p.in_stock && title_contains(card_name, &p.name))
-            .map(|p| StoreResult {
-                store_name: STORE_NAME.to_string(),
-                card_name: card_name.to_string(),
-                price: p.price,
-                url: p.url,
-            })
-            .collect();
+        // Filter by card name in the product title, then verify each match
+        // by fetching the product page and checking for "Wizards of the Coast"
+        // to confirm it's actually a Magic card (not a sleeve, playmat, etc.).
+        let mut matching: Vec<StoreResult> = Vec::new();
+        for p in all_products {
+            if !p.in_stock || !title_contains(card_name, &p.name) {
+                continue;
+            }
+            match is_magic_card(client, &p.url) {
+                Ok(true) => {
+                    matching.push(StoreResult {
+                        store_name: STORE_NAME.to_string(),
+                        card_name: card_name.to_string(),
+                        price: p.price,
+                        url: p.url,
+                    });
+                }
+                Ok(false) => {
+                    // Product page exists but isn't a Magic card — skip.
+                }
+                Err(e) => {
+                    // If we can't check the product page, skip it rather
+                    // than returning a potentially false result.
+                    eprintln!(
+                        "Warning: failed to verify midgardgames.no product {}: {e}",
+                        p.url
+                    );
+                }
+            }
+        }
 
         Ok(matching)
     }
+}
+
+// --- Product page verification -----------------------------------------------
+
+/// Fetch the product page and check if it's a Magic: The Gathering card
+/// by looking for "Wizards of the Coast" in the HTML.
+fn is_magic_card(client: &reqwest::blocking::Client, product_url: &str) -> anyhow::Result<bool> {
+    let response = client
+        .get(product_url)
+        .send()
+        .context("Failed to fetch midgardgames.no product page")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "midgardgames.no product page returned HTTP {}",
+            response.status().as_u16()
+        );
+    }
+
+    let html = response
+        .text()
+        .context("Failed to read midgardgames.no product page body")?;
+
+    Ok(html.contains("Wizards of the Coast"))
 }
 
 // --- HTML scraping ---------------------------------------------------------
@@ -176,6 +218,24 @@ fn parse_price(raw: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_magic_card() {
+        // Requires network; skips gracefully on failure (e.g. CI / offline).
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("cardfetch-test/0.1")
+            .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
+            .build()
+            .unwrap();
+
+        match is_magic_card(
+            &client,
+            "https://midgardgames.no/products/clb-870-u-skullclamp",
+        ) {
+            Ok(is_magic) => assert!(is_magic),
+            Err(_) => eprintln!("Skipping test_is_magic_card: network failed"),
+        }
+    }
 
     #[test]
     fn test_parse_price() {
