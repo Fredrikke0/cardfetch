@@ -118,8 +118,8 @@ pub(crate) fn rescue_js_snippet() -> &'static str {
 // ── Headless-browser CardMarket implementation ─────────────────────────────
 
 /// Holds a running Chrome browser, its virtual display, and the reusable tab.
-/// Wrapped in `Mutex<Option<...>>` so it can be lazily created and recreated
-/// if the browser dies while idle in long-running server mode.
+/// Created fresh for each request batch and torn down afterwards, so Chrome
+/// never lives longer than a single fetch operation.
 struct BrowserSession {
     _browser: Browser,
     tab: Arc<headless_chrome::Tab>,
@@ -137,9 +137,8 @@ impl Drop for BrowserSession {
 }
 
 pub struct CardMarket {
-    /// Serializes access to the single browser tab and holds the browser
-    /// session itself.  `None` means the browser hasn't been started yet
-    /// or it died and needs to be recreated.
+    /// Serializes access to the single browser tab.  The session is created
+    /// at the start of a request batch and torn down afterwards.
     session: Mutex<Option<BrowserSession>>,
     card_cache: Mutex<std::collections::HashMap<String, CardResults>>,
     /// Optional persistent SQLite cache — when set, CardMarket persists
@@ -159,9 +158,6 @@ struct CardResults {
 impl CardMarket {
     pub fn new(verbose: bool, persistent_cache: Option<Arc<crate::cache::Cache>>) -> Self {
         CardMarket {
-            // Browser is created lazily on the first fetch request.
-            // This avoids keeping a Chrome process alive indefinitely
-            // in long-running server mode.
             session: Mutex::new(None),
             card_cache: Mutex::new(std::collections::HashMap::new()),
             persistent_cache,
@@ -191,6 +187,10 @@ impl CardMarket {
                 std::ffi::OsStr::new("--no-first-run"),
                 std::ffi::OsStr::new("--no-default-browser-check"),
                 std::ffi::OsStr::new("--disable-features=TranslateUI"),
+                // Cap V8 heap at 512 MB and keep a single renderer process
+                // to bound memory usage in headless mode.
+                std::ffi::OsStr::new("--js-flags=--max-old-space-size=512"),
+                std::ffi::OsStr::new("--renderer-process-limit=1"),
             ])
             .build()
             .expect("Failed to build Chrome launch options");
@@ -231,7 +231,7 @@ impl CardMarket {
     ) -> anyhow::Result<Arc<headless_chrome::Tab>> {
         if session_guard.is_none() {
             if verbose {
-                eprintln!("  [cardmarket] starting browser (lazy init)...");
+                eprintln!("  [cardmarket] starting browser...");
             }
             *session_guard = Some(Self::create_session(verbose)?);
         }
@@ -355,8 +355,6 @@ impl Store for CardMarket {
             return Ok(vec![]);
         }
 
-        // Serialize access to the single shared browser tab and ensure a
-        // live session exists (lazy init or recreate-after-death).
         let mut session_guard = self.session.lock().unwrap();
 
         // Check if we already fetched this card (all 3 sub-endpoints) in one
@@ -374,8 +372,9 @@ impl Store for CardMarket {
         }
 
         // Not in cache — fetch all three endpoints in a single tab so the
-        // Cloudflare session (cookies, localStorage, etc.) carries over.
-        // If the browser died while idle, we recreate the session and retry once.
+        // Cloudflare session carries over.  The browser is created fresh per
+        // request batch, so idle death is not a concern; one retry exists as
+        // a safety net for rare mid-batch crashes.
         let slug = title_to_slug(card_name);
 
         for attempt in 0..2 {
@@ -396,9 +395,6 @@ impl Store for CardMarket {
                         STORE_PREFIX_INT_PRIVATE => results.int_private.clone(),
                         _ => anyhow::bail!("Unknown CardMarket sub-store: {}", sub_key),
                     };
-                    // Persist ALL sub-endpoints to the SQLite cache so that
-                    // the next run hits the cache for every cache key, not
-                    // just the one that happened to miss this time.
                     self.persist_all_sub_results(card_name, &results);
                     self.card_cache
                         .lock()
@@ -415,14 +411,8 @@ impl Store for CardMarket {
                     }
                 }
                 Err(e) if Self::is_browser_dead(&e) && attempt == 0 => {
-                    // Browser died while idle — discard and recreate.
-                    eprintln!(
-                        "  [{}] CardMarket browser died — recreating session for '{}'",
-                        sub_key, card_name
-                    );
+                    // Browser crashed mid-batch — recreate and retry once.
                     *session_guard = None;
-                    // Clear in-memory card cache too — the new browser
-                    // session won't have Cloudflare cookies from the old one.
                     self.card_cache.lock().unwrap().clear();
                     continue;
                 }
@@ -440,12 +430,15 @@ impl Store for CardMarket {
             }
         }
 
-        // Unreachable — the loop always returns or continues at most once.
         unreachable!()
     }
-}
 
-// ── Fetch methods ──────────────────────────────────────────────────────────
+    fn teardown(&self) {
+        let mut guard = self.session.lock().unwrap();
+        *guard = None;
+        self.card_cache.lock().unwrap().clear();
+    }
+}
 
 impl CardMarket {
     /// Persist all three sub-endpoints' results to the SQLite cache.
@@ -588,6 +581,15 @@ impl CardMarket {
         }
 
         Ok(all_entries)
+    }
+}
+
+// headless_chrome uses synchronous tungstenite (no tokio runtime), so
+// BrowserSession drop is safe from any thread context.
+impl Drop for CardMarket {
+    fn drop(&mut self) {
+        let mut guard = self.session.lock().unwrap();
+        *guard = None;
     }
 }
 

@@ -100,6 +100,11 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<StoreResult>> {
         self.search(client, card_name)
     }
+
+    /// Called when a batch of searches finishes.  Stores that hold
+    /// heavyweight resources (e.g. a Chrome browser process) can
+    /// use this to release them between requests.  Default is a no-op.
+    fn teardown(&self) {}
 }
 
 /// Register all store backends here.

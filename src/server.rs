@@ -11,6 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tower_http::cors::CorsLayer;
 
+// ── Per-store status ─────────────────────────────────────────────────────────
+
+/// Tracks progress for a single store during a fetch job.
+#[derive(Serialize, Clone, Debug)]
+pub struct StoreStatus {
+    pub store: String,
+    pub status: String,
+    pub cards_found: usize,
+}
+
 // ── Request types ────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -242,6 +252,8 @@ struct Job {
     /// Heuristic result available immediately while exhaustive runs.
     partial_result: Option<JobResult>,
     error: Option<String>,
+    /// Per-store status tracking (fetch jobs only).
+    store_statuses: Option<Arc<Mutex<HashMap<String, StoreStatus>>>>,
 }
 
 #[derive(Serialize)]
@@ -263,6 +275,8 @@ struct JobResponse {
     partial_result: Option<JobResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    store_statuses: Option<Vec<StoreStatus>>,
 }
 
 impl Job {
@@ -286,6 +300,11 @@ impl Job {
         } else {
             (0, String::new(), String::new())
         };
+        let store_statuses = self
+            .store_statuses
+            .as_ref()
+            .map(|ss| ss.lock().unwrap().values().cloned().collect());
+
         JobResponse {
             status: self.status.clone(),
             kind: kind.into(),
@@ -300,6 +319,7 @@ impl Job {
             result: self.result.clone(),
             partial_result: self.partial_result.clone(),
             error: self.error.clone(),
+            store_statuses,
         }
     }
 }
@@ -552,19 +572,23 @@ async fn start_fetch(
     }
 
     // Resolve partial/ambiguous card names via Scryfall autocomplete.
+    // reqwest::blocking::Client creates its own tokio Runtime internally,
+    // which panics on drop from a tokio worker thread (Tokio >= 1.53).
+    // Use block_in_place to move this work to a blocking OS thread.
     let unrecognized: Vec<String>;
-    {
+    let (resolved, unres) = tokio::task::block_in_place(|| {
         let client = reqwest::blocking::Client::builder()
             .user_agent("CardFetch/0.1")
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| format!("Failed to build Scryfall client: {e}"))?;
         let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
-        let (resolved, unres) = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        cards = resolved;
-        unrecognized = unres;
-    }
+        crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+            .map_err(|e| format!("Scryfall resolution failed: {e}"))
+    })
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    cards = resolved;
+    unrecognized = unres;
 
     // Determine which store indices are active.
     let stores: Vec<usize> = state
@@ -613,6 +637,24 @@ async fn start_fetch(
     let cards_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let current = Arc::new(Mutex::new((String::new(), String::new())));
 
+    // Build per-store status map — all stores start as "pending".
+    let store_statuses: Arc<Mutex<HashMap<String, StoreStatus>>> = Arc::new(Mutex::new(
+        stores
+            .iter()
+            .map(|&si| {
+                let name = state.stores[si].name().to_string();
+                (
+                    name.clone(),
+                    StoreStatus {
+                        store: name,
+                        status: "pending".into(),
+                        cards_found: 0,
+                    },
+                )
+            })
+            .collect(),
+    ));
+
     state
         .reserve_slot(JobKind::Fetch)
         .map_err(|(code, msg, ids)| {
@@ -642,6 +684,7 @@ async fn start_fetch(
         result: None,
         partial_result: None,
         error: None,
+        store_statuses: Some(store_statuses.clone()),
     }));
 
     state
@@ -660,6 +703,7 @@ async fn start_fetch(
     let current = current.clone();
     let unrecognized_for_job = unrecognized.clone();
     let max_per_store = req.max_per_store;
+    let store_statuses_clone = store_statuses.clone();
 
     std::thread::spawn(move || {
         {
@@ -674,7 +718,14 @@ async fn start_fetch(
             cache.clone(),
             cards_done,
             current,
+            store_statuses_clone,
         );
+
+        // Shut down heavyweight store resources (Chrome browser) now that
+        // this batch is done, so they don't linger between requests.
+        for store in stores_arc.iter() {
+            store.teardown();
+        }
 
         // Group results by (card, cache_key) so we can cap per store endpoint
         let mut per_key: HashMap<(String, String), Vec<CardResultEntry>> = HashMap::new();
@@ -740,19 +791,22 @@ async fn start_wizard(
     }
 
     // Resolve card names via Scryfall so they match the /fetch cache keys.
+    // reqwest::blocking::Client creates its own tokio Runtime internally;
+    // use block_in_place to move this work to a blocking OS thread.
     let unrecognized: Vec<String>;
-    {
+    let (resolved, unres) = tokio::task::block_in_place(|| {
         let client = reqwest::blocking::Client::builder()
             .user_agent("CardFetch/0.1")
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(|e| format!("Failed to build Scryfall client: {e}"))?;
         let cache_ref = state.cache.as_ref().map(|c| c.as_ref());
-        let (resolved, unres) = crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        cards = resolved;
-        unrecognized = unres;
-    }
+        crate::scryfall::resolve_with_cache(&client, &cards, &cache_ref)
+            .map_err(|e| format!("Scryfall resolution failed: {e}"))
+    })
+    .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    cards = resolved;
+    unrecognized = unres;
 
     // Cap tolerance: skipping every card produces a useless zero-cost solution.
     let tolerance = req.tolerance.min(cards.len().saturating_sub(1));
@@ -874,6 +928,7 @@ async fn start_wizard(
         result: None,
         partial_result: None,
         error: None,
+        store_statuses: None,
     }));
 
     state
@@ -1046,6 +1101,7 @@ fn run_search_parallel(
     cache: Option<Arc<Cache>>,
     cards_done: Arc<std::sync::atomic::AtomicUsize>,
     current: Arc<Mutex<(String, String)>>,
+    store_statuses: Arc<Mutex<HashMap<String, StoreStatus>>>,
 ) -> Vec<StoreResult> {
     let cards_arc = Arc::new(cards.to_vec());
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1058,17 +1114,28 @@ fn run_search_parallel(
         let cache = cache.clone();
         let cards_done = cards_done.clone();
         let current = current.clone();
+        let store_statuses = store_statuses.clone();
 
         let handle = std::thread::spawn(move || {
             let store = &stores[si];
             let store_name = store.name().to_string();
             let timeout = Duration::from_secs(store.timeout_secs());
 
+            // Mark this store as "fetching".
+            {
+                let mut ss = store_statuses.lock().unwrap();
+                if let Some(entry) = ss.get_mut(&store_name) {
+                    entry.status = "fetching".into();
+                }
+            }
+
             let client = reqwest::blocking::Client::builder()
                 .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
                 .timeout(timeout)
                 .build()
                 .expect("Failed to build per-store HTTP client");
+
+            let mut store_cards_found: usize = 0;
 
             for card_name in cards.iter() {
                 {
@@ -1141,7 +1208,7 @@ fn run_search_parallel(
                                         || msg.contains("connection closed")
                                     {
                                         eprintln!(
-                                            "  [{}] CardMarket browser died — restart server. '{}'",
+                                            "  [{}] CardMarket browser died mid-batch — '{}' not fetched",
                                             key, card_name
                                         );
                                     } else {
@@ -1153,6 +1220,9 @@ fn run_search_parallel(
                     }
                 }
 
+                let found_this_card = results_for_card.len();
+                store_cards_found += found_this_card;
+
                 for result in results_for_card {
                     if tx.send(result).is_err() {
                         break;
@@ -1160,6 +1230,15 @@ fn run_search_parallel(
                 }
 
                 cards_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Mark store as done.
+            {
+                let mut ss = store_statuses.lock().unwrap();
+                if let Some(entry) = ss.get_mut(&store_name) {
+                    entry.status = "done".into();
+                    entry.cards_found = store_cards_found;
+                }
             }
         });
 
