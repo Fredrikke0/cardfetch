@@ -361,6 +361,30 @@ struct FastMove {
 struct DeltaPrecompute {
     base_excess: usize,
     base_store_penalty: i64, // Cheapest strategy only; zero for Simplest
+    /// `shipping_cost(si, store_totals[si], store_card_counts[si])` for the
+    /// current assignment, with 0 for unused stores.  Lets the fast delta path
+    /// avoid recomputing the "before" shipping term on every candidate move.
+    store_shipping: Vec<u64>,
+}
+
+/// Per-card constants for the specialized Move-1 delta in `best_neighbor`.
+/// Computed once per card (outside the per-option loop) to keep the inner
+/// loop branch-light.
+struct Move1Hoist {
+    old_price: u32,
+    old_si: Option<usize>,
+    old_store_empties: bool,
+    old_ship_delta: i64,
+    skip_delta: i64,
+}
+
+/// A move produced by `best_neighbor`: the sequence of single-card moves to
+/// apply, plus the exact score the resulting assignment will have.  Returning
+/// this descriptor (instead of a fully cloned/applied `ScoredAssignment`)
+/// avoids cloning the large per-store vectors on every candidate.
+struct Neighbor {
+    moves: Vec<(usize, Option<usize>)>,
+    score: u64,
 }
 
 /// An assignment with all derived state precomputed, enabling O(1) delta
@@ -692,8 +716,7 @@ impl ScoredAssignment {
                     let old_total = self.store_totals[si] as u64;
                     let new_total = (old_total as i64 + price_delta) as u64;
                     let count = self.store_card_counts[si];
-                    input.shipping_cost(si, new_total, count) as i64
-                        - input.shipping_cost(si, old_total, count) as i64
+                    input.shipping_cost(si, new_total, count) as i64 - pre.store_shipping[si] as i64
                 }
             } else {
                 0
@@ -703,18 +726,16 @@ impl ScoredAssignment {
             if let Some(si) = info.old_si {
                 let old_total = self.store_totals[si] as u64;
                 let new_total = old_total.saturating_sub(info.old_price as u64);
-                let old_count = self.store_card_counts[si];
-                let new_count = old_count.saturating_sub(1);
-                d += input.shipping_cost(si, new_total, new_count) as i64
-                    - input.shipping_cost(si, old_total, old_count) as i64;
+                let count = self.store_card_counts[si];
+                d += input.shipping_cost(si, new_total, count.saturating_sub(1)) as i64
+                    - pre.store_shipping[si] as i64;
             }
             if let Some(si) = info.new_si {
                 let old_total = self.store_totals[si] as u64;
                 let new_total = old_total + info.new_price as u64;
-                let old_count = self.store_card_counts[si];
-                let new_count = old_count + 1;
-                d += input.shipping_cost(si, new_total, new_count) as i64
-                    - input.shipping_cost(si, old_total, old_count) as i64;
+                let count = self.store_card_counts[si];
+                d += input.shipping_cost(si, new_total, count + 1) as i64
+                    - pre.store_shipping[si] as i64;
             }
             d
         };
@@ -734,6 +755,197 @@ impl ScoredAssignment {
         };
 
         cost_delta + strategy_delta + skip_cost_delta
+    }
+
+    /// Build per-card constants for the Move-1 inner loop.  The old-side
+    /// shipping delta, store-empties flag, and skip-penalty delta depend only
+    /// on the card's current choice, so they are computed once per card.
+    #[inline]
+    fn move1_hoist(
+        &self,
+        ci: usize,
+        input: &WizardInput,
+        config: &WizardConfig,
+        pre: &DeltaPrecompute,
+    ) -> Move1Hoist {
+        let card = &input.cards[ci];
+        let cur = self.choices[ci];
+        let old_price = cur.map_or(0, |oi| card.options[oi].price);
+        let old_si = cur.map(|oi| card.options[oi].store_idx);
+
+        let old_store_empties = old_si.is_some_and(|si| self.store_card_counts[si] == 1);
+        let old_ship_delta = match old_si {
+            Some(si) => {
+                let old_total = self.store_totals[si] as u64;
+                let new_total = old_total.saturating_sub(old_price as u64);
+                let count = self.store_card_counts[si];
+                input.shipping_cost(si, new_total, count.saturating_sub(1)) as i64
+                    - pre.store_shipping[si] as i64
+            }
+            None => 0,
+        };
+        let skip_delta = if old_si.is_none() {
+            let new_excess = (self.num_skipped.saturating_sub(1)).saturating_sub(config.tolerance);
+            (new_excess as i64 - pre.base_excess as i64) * SKIP_PENALTY as i64
+        } else {
+            0
+        };
+
+        Move1Hoist {
+            old_price,
+            old_si,
+            old_store_empties,
+            old_ship_delta,
+            skip_delta,
+        }
+    }
+
+    /// Specialized Move-1 delta for `new_oi == Some(..)`.  `new_si` and
+    /// `new_price` come straight from the candidate option, avoiding the
+    /// generic `move_info`/`delta_from_info_pre` indirection.  Must match
+    /// `delta_from_info_pre` exactly for the `new_si = Some` case.
+    #[inline]
+    fn move1_delta(
+        &self,
+        hoist: &Move1Hoist,
+        new_si: usize,
+        new_price: u32,
+        input: &WizardInput,
+        config: &WizardConfig,
+        pre: &DeltaPrecompute,
+    ) -> i64 {
+        let price_delta = new_price as i64 - hoist.old_price as i64;
+
+        let store_delta: i64 = if hoist.old_si == Some(new_si) {
+            0
+        } else {
+            -(hoist.old_store_empties as i64) + (self.store_card_counts[new_si] == 0) as i64
+        };
+
+        let shipping_delta: i64 = if hoist.old_si == Some(new_si) {
+            if input.shipping_free_thresholds[new_si] == 0
+                && input.shipping_card_limits[new_si] == 0
+            {
+                0
+            } else {
+                let old_total = self.store_totals[new_si] as u64;
+                let new_total = (old_total as i64 + price_delta) as u64;
+                input.shipping_cost(new_si, new_total, self.store_card_counts[new_si]) as i64
+                    - pre.store_shipping[new_si] as i64
+            }
+        } else {
+            hoist.old_ship_delta
+                + input.shipping_cost(
+                    new_si,
+                    self.store_totals[new_si] as u64 + new_price as u64,
+                    self.store_card_counts[new_si] + 1,
+                ) as i64
+                - pre.store_shipping[new_si] as i64
+        };
+
+        let cost_delta = price_delta + shipping_delta;
+        let strategy_delta = match config.strategy {
+            Strategy::Simplest => store_delta * PRICE_WEIGHT as i64,
+            Strategy::Cheapest => {
+                let new_num_stores = (self.num_stores as i64 + store_delta) as usize;
+                (new_num_stores.saturating_sub(1)) as i64 * STORE_PENALTY as i64
+                    - pre.base_store_penalty
+            }
+        };
+
+        cost_delta + strategy_delta + hoist.skip_delta
+    }
+
+    /// Exact delta for a card swap: move `ci` (currently at store `si`) to
+    /// `cj`'s store, and `cj` (currently at store `sj`) to `ci`'s store.
+    /// Both cards stay assigned, so store counts, `num_stores`, and
+    /// `num_skipped` are all unchanged — only the two store totals change.
+    fn swap_delta(
+        &self,
+        ci: usize,
+        ci_new_oi: usize,
+        cj: usize,
+        cj_new_oi: usize,
+        input: &WizardInput,
+        pre: &DeltaPrecompute,
+    ) -> i64 {
+        let card_ci = &input.cards[ci];
+        let card_cj = &input.cards[cj];
+        let old_oi_ci = self.choices[ci].expect("swap card must be assigned");
+        let old_oi_cj = self.choices[cj].expect("swap card must be assigned");
+
+        let si = card_ci.options[old_oi_ci].store_idx;
+        let sj = card_cj.options[old_oi_cj].store_idx;
+
+        let old_price_ci = card_ci.options[old_oi_ci].price as u64;
+        let old_price_cj = card_cj.options[old_oi_cj].price as u64;
+        let new_price_ci = card_ci.options[ci_new_oi].price as u64;
+        let new_price_cj = card_cj.options[cj_new_oi].price as u64;
+
+        let price_delta = (new_price_ci as i64 - old_price_ci as i64)
+            + (new_price_cj as i64 - old_price_cj as i64);
+
+        let count_si = self.store_card_counts[si];
+        let new_total_si = self.store_totals[si] as u64 - old_price_ci + new_price_cj;
+        let ship_delta_si =
+            input.shipping_cost(si, new_total_si, count_si) as i64 - pre.store_shipping[si] as i64;
+
+        let count_sj = self.store_card_counts[sj];
+        let new_total_sj = self.store_totals[sj] as u64 - old_price_cj + new_price_ci;
+        let ship_delta_sj =
+            input.shipping_cost(sj, new_total_sj, count_sj) as i64 - pre.store_shipping[sj] as i64;
+
+        price_delta + ship_delta_si + ship_delta_sj
+    }
+
+    /// Exact score after bulk-merging `from_si` into `to_si` (moving every
+    /// card in `moves`).  `from_si` empties, so `num_stores` drops by one and
+    /// `num_skipped` is unchanged.
+    fn merge_score(
+        &self,
+        from_si: usize,
+        to_si: usize,
+        moves: &[(usize, usize)],
+        input: &WizardInput,
+        config: &WizardConfig,
+        pre: &DeltaPrecompute,
+    ) -> u64 {
+        let mut card_total_delta: i64 = 0;
+        let mut new_total_to = self.store_totals[to_si] as u64;
+        for &(ci, oi) in moves {
+            let card = &input.cards[ci];
+            let old_oi = self.choices[ci].expect("merge card must be assigned");
+            card_total_delta += card.options[oi].price as i64 - card.options[old_oi].price as i64;
+            new_total_to += card.options[oi].price as u64;
+        }
+        let new_count_to = self.store_card_counts[to_si] + moves.len();
+
+        // `from_si` drops to zero cards (shipping 0); only `to_si` changes
+        // on the positive side.  Other stores are untouched.
+        let shipping_delta = input.shipping_cost(to_si, new_total_to, new_count_to) as i64
+            - pre.store_shipping[to_si] as i64
+            - pre.store_shipping[from_si] as i64;
+
+        let strategy_delta = match config.strategy {
+            Strategy::Simplest => -(PRICE_WEIGHT as i64),
+            Strategy::Cheapest => -(STORE_PENALTY as i64),
+        };
+
+        self.score
+            .wrapping_add_signed(card_total_delta + shipping_delta + strategy_delta)
+    }
+
+    /// Apply a list of single-card moves in sequence, updating all cached
+    /// state.  Used to materialize the neighbor returned by `best_neighbor`.
+    fn apply_moves(
+        &mut self,
+        moves: &[(usize, Option<usize>)],
+        input: &WizardInput,
+        config: &WizardConfig,
+    ) {
+        for &(ci, new_oi) in moves {
+            self.apply_single_move(ci, new_oi, input, config);
+        }
     }
 
     /// Apply a single-card move and update all cached state.
@@ -1042,7 +1254,6 @@ pub(crate) fn select_candidate_stores(input: &WizardInput) -> Vec<usize> {
     if input.card_count() <= 1 {
         return candidates;
     }
-    let n_cards = input.card_count();
     let mut dominated: HashSet<usize> = HashSet::new();
     for (i, &si) in candidates.iter().enumerate() {
         if dominated.contains(&si) {
@@ -1061,11 +1272,13 @@ pub(crate) fn select_candidate_stores(input: &WizardInput) -> Vec<usize> {
                 continue;
             }
             // sj must carry every card that si carries, at ≤ price.
-            let sj_dominates_si = (0..n_cards).all(|ci| match input.cheapest_at(ci, si) {
-                None => true,
-                Some((_, si_price)) => input
+            // Only iterate the cards si actually carries (store_cards), not
+            // every card in the deck.
+            let sj_dominates_si = input.store_cards[si].iter().all(|&ci| {
+                let si_price = input.cheapest_at(ci, si).map(|(_, p)| p).unwrap();
+                input
                     .cheapest_at(ci, sj)
-                    .is_some_and(|(_, sj_price)| sj_price <= si_price),
+                    .is_some_and(|(_, sj_price)| sj_price <= si_price)
             });
             if sj_dominates_si {
                 dominated.insert(si);
@@ -1288,6 +1501,20 @@ impl TopSolutions {
         }
     }
 
+    /// Like `insert`, but clones the assignment only when it actually makes
+    /// the top `max_count`.  Avoids a full `ScoredAssignment` clone for the
+    /// (usually many) trials that are not retained.
+    fn insert_ref(&mut self, sa: &ScoredAssignment) {
+        if self.entries.iter().any(|e| e.choices == sa.choices) {
+            return;
+        }
+        let pos = self.entries.partition_point(|e| e.score < sa.score);
+        if pos < self.max_count {
+            self.entries.insert(pos, sa.clone());
+            self.entries.truncate(self.max_count);
+        }
+    }
+
     /// The single best assignment (panics if empty).
     fn best(&self) -> &ScoredAssignment {
         &self.entries[0]
@@ -1306,16 +1533,16 @@ impl TopSolutions {
 /// carries it.  Cards not available in any store in the set are skipped.
 fn greedy_assign(input: &WizardInput, store_set: &[usize]) -> Assignment {
     let n = input.card_count();
-    let set: HashSet<usize> = store_set.iter().copied().collect();
     let mut choices = vec![None; n];
     for (ci, choice) in choices.iter_mut().enumerate().take(n) {
-        let best = input.cards[ci]
-            .options
-            .iter()
-            .enumerate()
-            .filter(|(_, opt)| set.contains(&opt.store_idx))
-            .min_by_key(|(_, opt)| opt.price);
-        *choice = best.map(|(oi, _)| oi);
+        // Options are sorted by price ascending, so the first option whose
+        // store is in `store_set` is the cheapest available option.
+        for (oi, opt) in input.cards[ci].options.iter().enumerate() {
+            if store_set.contains(&opt.store_idx) {
+                *choice = Some(oi);
+                break;
+            }
+        }
     }
     Assignment { choices }
 }
@@ -1332,13 +1559,18 @@ fn used_store_indices(sa: &ScoredAssignment) -> Vec<usize> {
 
 /// Build a trial store set by adding and/or removing one store, run greedy
 /// assignment + hill-climb, and return the resulting scored assignment.
+///
+/// `hill_climb` is deterministic, so two trials that seed the same greedy
+/// assignment produce identical results.  When that happens (recorded in
+/// `seen_seeds`), this returns `None` without paying for the climb again.
 fn try_store_set(
     input: &WizardInput,
     config: &WizardConfig,
     current: &[usize],
     add: Option<usize>,
     remove: Option<usize>,
-) -> ScoredAssignment {
+    seen_seeds: &mut HashSet<Vec<Option<usize>>>,
+) -> Option<ScoredAssignment> {
     let mut trial: Vec<usize> = current
         .iter()
         .enumerate()
@@ -1350,7 +1582,14 @@ fn try_store_set(
     }
     SWAP_TRIAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let raw = greedy_assign(input, &trial);
-    hill_climb(ScoredAssignment::new(raw, input, config), input, config)
+    if !seen_seeds.insert(raw.choices.clone()) {
+        return None;
+    }
+    Some(hill_climb(
+        ScoredAssignment::new(raw, input, config),
+        input,
+        config,
+    ))
 }
 
 /// Explore alternative store combinations by trying add/swap/remove
@@ -1365,7 +1604,11 @@ fn store_swap_search(
     top: &mut TopSolutions,
 ) {
     let mut best = initial.clone();
-    top.insert(best.clone());
+    top.insert_ref(&best);
+
+    // `try_store_set` is deterministic, so deduplicate by its greedy seed
+    // across the whole search (not just within one iteration).
+    let mut seen_seeds: HashSet<Vec<Option<usize>>> = HashSet::new();
 
     loop {
         let old_score = best.score;
@@ -1377,8 +1620,17 @@ fn store_swap_search(
             if current_stores.contains(&new_si) {
                 continue;
             }
-            let trial = try_store_set(input, config, &current_stores, Some(new_si), None);
-            top.insert(trial.clone());
+            let Some(trial) = try_store_set(
+                input,
+                config,
+                &current_stores,
+                Some(new_si),
+                None,
+                &mut seen_seeds,
+            ) else {
+                continue;
+            };
+            top.insert_ref(&trial);
             if trial.score < old_score && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
             {
                 best_trial = Some(trial);
@@ -1391,8 +1643,17 @@ fn store_swap_search(
                 if current_stores.contains(&new_si) {
                     continue;
                 }
-                let trial = try_store_set(input, config, &current_stores, Some(new_si), Some(idx));
-                top.insert(trial.clone());
+                let Some(trial) = try_store_set(
+                    input,
+                    config,
+                    &current_stores,
+                    Some(new_si),
+                    Some(idx),
+                    &mut seen_seeds,
+                ) else {
+                    continue;
+                };
+                top.insert_ref(&trial);
                 if trial.score < old_score
                     && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
                 {
@@ -1404,8 +1665,17 @@ fn store_swap_search(
         // Remove a store (if more than one).
         if current_stores.len() > 1 {
             for (idx, _) in current_stores.iter().enumerate() {
-                let trial = try_store_set(input, config, &current_stores, None, Some(idx));
-                top.insert(trial.clone());
+                let Some(trial) = try_store_set(
+                    input,
+                    config,
+                    &current_stores,
+                    None,
+                    Some(idx),
+                    &mut seen_seeds,
+                ) else {
+                    continue;
+                };
+                top.insert_ref(&trial);
                 if trial.score < old_score
                     && best_trial.as_ref().is_none_or(|b| trial.score < b.score)
                 {
@@ -1550,8 +1820,14 @@ fn best_neighbor(
     current: &ScoredAssignment,
     input: &WizardInput,
     config: &WizardConfig,
-) -> Option<ScoredAssignment> {
+) -> Option<Neighbor> {
     // Precompute values that are constant for the entire neighbor scan.
+    let mut store_shipping = vec![0u64; input.store_names.len()];
+    for (si, &count) in current.store_card_counts.iter().enumerate() {
+        if count > 0 {
+            store_shipping[si] = input.shipping_cost(si, current.store_totals[si] as u64, count);
+        }
+    }
     let pre = DeltaPrecompute {
         base_excess: current.num_skipped.saturating_sub(config.tolerance),
         base_store_penalty: if matches!(config.strategy, Strategy::Cheapest) {
@@ -1559,10 +1835,11 @@ fn best_neighbor(
         } else {
             0
         },
+        store_shipping,
     };
 
-    let mut best_delta: i64 = 0;
-    let mut best_move: Option<(usize, Option<usize>)> = None;
+    let mut best: Option<Neighbor> = None;
+    let mut best_score = current.score;
     let n = input.card_count();
 
     // ── Move 1: Reassign a single card (delta scoring, O(1) per candidate) ─
@@ -1571,9 +1848,12 @@ fn best_neighbor(
         let card = &input.cards[ci];
         let cur = current.choices[ci];
 
-        // Hoist old price & store to avoid per-option card.options[] lookups.
-        let old_price = cur.map_or(0, |oi| card.options[oi].price);
-        let old_si = cur.map(|oi| card.options[oi].store_idx);
+        // Hoist per-card constants once (old price/store, old-side shipping
+        // delta, store-empties flag, skip penalty), then score each candidate
+        // option with the specialized Move-1 delta.
+        let hoist = current.move1_hoist(ci, input, config, &pre);
+        let old_price = hoist.old_price;
+        let old_si = hoist.old_si;
 
         let row_off = ci * n_st;
         for oi in 0..card.options.len() {
@@ -1590,20 +1870,14 @@ fn best_neighbor(
             if Some(opt.store_idx) == old_si && opt.price >= old_price {
                 continue;
             }
-            let delta = current.try_single_move_delta_pre_fast(
-                &FastMove {
-                    ci,
-                    old_price,
-                    old_si,
-                    new_oi: Some(oi),
-                },
-                input,
-                config,
-                &pre,
-            );
-            if delta < best_delta {
-                best_delta = delta;
-                best_move = Some((ci, Some(oi)));
+            let delta = current.move1_delta(&hoist, opt.store_idx, opt.price, input, config, &pre);
+            let score = current.score.wrapping_add_signed(delta);
+            if score < best_score {
+                best_score = score;
+                best = Some(Neighbor {
+                    moves: vec![(ci, Some(oi))],
+                    score,
+                });
             }
         }
 
@@ -1619,9 +1893,13 @@ fn best_neighbor(
                 config,
                 &pre,
             );
-            if delta < best_delta {
-                best_delta = delta;
-                best_move = Some((ci, None));
+            let score = current.score.wrapping_add_signed(delta);
+            if score < best_score {
+                best_score = score;
+                best = Some(Neighbor {
+                    moves: vec![(ci, None)],
+                    score,
+                });
             }
         }
 
@@ -1638,21 +1916,16 @@ fn best_neighbor(
                 config,
                 &pre,
             );
-            if delta < best_delta {
-                best_delta = delta;
-                best_move = Some((ci, Some(0)));
+            let score = current.score.wrapping_add_signed(delta);
+            if score < best_score {
+                best_score = score;
+                best = Some(Neighbor {
+                    moves: vec![(ci, Some(0))],
+                    score,
+                });
             }
         }
     }
-
-    // Build the best result seen so far from the best single-card move (Move 1).
-    // Subsequent move types (swap, consolidate, bulk-merge) compete against this.
-    let mut best_result: Option<ScoredAssignment> = best_move.map(|(ci, new_oi)| {
-        let mut nb = current.clone();
-        nb.apply_single_move(ci, new_oi, input, config);
-        nb
-    });
-    let mut best_score = best_result.as_ref().map_or(current.score, |r| r.score);
 
     // ── Precompute card-to-store index for all moves below ────────────────
     // Fast path: use the incrementally-maintained cards_at from ScoredAssignment.
@@ -1686,30 +1959,23 @@ fn best_neighbor(
                 }
                 for &ci in &cards_at[si] {
                     let ci_at_sj = match input.cheapest_at(ci, sj) {
-                        Some((oi, _)) => Some(oi),
+                        Some((oi, _)) => oi,
                         None => continue,
                     };
-                    let delta_ci =
-                        current.try_single_move_delta_pre(ci, ci_at_sj, input, config, &pre);
-                    // Quick filter: even the first move alone must not be too
-                    // expensive (the second move can only help marginally).
-                    if (current.score as i64 + delta_ci) >= (best_score as i64) {
-                        continue;
-                    }
                     for &cj in &cards_at[sj] {
                         let cj_at_si = match input.cheapest_at(cj, si) {
-                            Some((oi, _)) => Some(oi),
+                            Some((oi, _)) => oi,
                             None => continue,
                         };
-                        // Combined delta = delta_ci + delta_cj (independent stores).
-                        let delta_cj =
-                            current.try_single_move_delta_pre(cj, cj_at_si, input, config, &pre);
-                        if (current.score as i64 + delta_ci + delta_cj) < (best_score as i64) {
-                            let mut nb = current.clone();
-                            nb.apply_single_move(ci, ci_at_sj, input, config);
-                            nb.apply_single_move(cj, cj_at_si, input, config);
-                            best_score = nb.score;
-                            best_result = Some(nb);
+                        let score = current.score.wrapping_add_signed(
+                            current.swap_delta(ci, ci_at_sj, cj, cj_at_si, input, &pre),
+                        );
+                        if score < best_score {
+                            best_score = score;
+                            best = Some(Neighbor {
+                                moves: vec![(ci, Some(ci_at_sj)), (cj, Some(cj_at_si))],
+                                score,
+                            });
                         }
                     }
                 }
@@ -1732,23 +1998,26 @@ fn best_neighbor(
                 if alt_opt.store_idx == from_si {
                     continue;
                 }
-                // Fast O(1) delta check before cloning.
                 let delta =
                     current.try_single_move_delta_pre(ci, Some(alt_oi), input, config, &pre);
-                if (current.score as i64 + delta) < (best_score as i64) {
-                    let mut nb = current.clone();
-                    nb.apply_single_move(ci, Some(alt_oi), input, config);
-                    best_score = nb.score;
-                    best_result = Some(nb);
+                let score = current.score.wrapping_add_signed(delta);
+                if score < best_score {
+                    best_score = score;
+                    best = Some(Neighbor {
+                        moves: vec![(ci, Some(alt_oi))],
+                        score,
+                    });
                 }
             }
             // Try skipping the card instead.
             let delta = current.try_single_move_delta_pre(ci, None, input, config, &pre);
-            if (current.score as i64 + delta) < (best_score as i64) {
-                let mut nb = current.clone();
-                nb.apply_single_move(ci, None, input, config);
-                best_score = nb.score;
-                best_result = Some(nb);
+            let score = current.score.wrapping_add_signed(delta);
+            if score < best_score {
+                best_score = score;
+                best = Some(Neighbor {
+                    moves: vec![(ci, None)],
+                    score,
+                });
             }
         }
     }
@@ -1788,18 +2057,17 @@ fn best_neighbor(
                 continue;
             }
 
-            let mut nb = current.clone();
-            for &(ci, oi) in &moves {
-                nb.apply_single_move(ci, Some(oi), input, config);
-            }
-            if nb.score < best_score {
-                best_score = nb.score;
-                best_result = Some(nb);
+            let score = current.merge_score(from_si, to_si, &moves, input, config, &pre);
+            if score < best_score {
+                best_score = score;
+                let moves: Vec<(usize, Option<usize>)> =
+                    moves.into_iter().map(|(ci, oi)| (ci, Some(oi))).collect();
+                best = Some(Neighbor { moves, score });
             }
         }
     }
 
-    best_result
+    best
 }
 
 // ── Simulated annealing ──────────────────────────────────────────────────────
@@ -2032,7 +2300,10 @@ fn hill_climb(
     loop {
         let neighbor = best_neighbor(&current, input, config);
         match neighbor {
-            Some(n) if n.score < current.score => current = n,
+            Some(n) if n.score < current.score => {
+                current.apply_moves(&n.moves, input, config);
+                debug_assert_eq!(current.score, n.score, "analytic neighbor score mismatch");
+            }
             _ => break,
         }
     }
@@ -2111,5 +2382,214 @@ fn build_solution(scored: &ScoredAssignment, input: &WizardInput) -> WizardSolut
         total_shipping,
         num_stores: used_stores.len(),
         score: scored.score,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_input() -> WizardInput {
+        WizardInput {
+            store_names: vec!["s0".into(), "s1".into(), "s2".into()],
+            cards: vec![
+                WizardCard {
+                    name: "c0".into(),
+                    options: vec![
+                        CardOption {
+                            store_idx: 0,
+                            price: 100,
+                            url: "u".into(),
+                        },
+                        CardOption {
+                            store_idx: 1,
+                            price: 90,
+                            url: "u".into(),
+                        },
+                        CardOption {
+                            store_idx: 2,
+                            price: 95,
+                            url: "u".into(),
+                        },
+                    ],
+                },
+                WizardCard {
+                    name: "c1".into(),
+                    options: vec![
+                        CardOption {
+                            store_idx: 0,
+                            price: 80,
+                            url: "u".into(),
+                        },
+                        CardOption {
+                            store_idx: 1,
+                            price: 70,
+                            url: "u".into(),
+                        },
+                    ],
+                },
+                WizardCard {
+                    name: "c2".into(),
+                    options: vec![
+                        CardOption {
+                            store_idx: 0,
+                            price: 60,
+                            url: "u".into(),
+                        },
+                        CardOption {
+                            store_idx: 2,
+                            price: 55,
+                            url: "u".into(),
+                        },
+                    ],
+                },
+            ],
+            shipping_bases: vec![50, 80, 0],
+            shipping_free_thresholds: vec![100, 0, 0],
+            min_orders: vec![0, 0, 50],
+            shipping_card_limits: vec![0, 2, 0],
+            shipping_card_surcharges: vec![0, 30, 0],
+            prices: vec![],
+            option_indices: vec![],
+            store_cards: vec![Vec::new(); 3],
+        }
+    }
+
+    fn move_info(card: &WizardCard, old_oi: Option<usize>, new_oi: Option<usize>) -> MoveInfo {
+        let old = old_oi.map(|oi| &card.options[oi]);
+        let new = new_oi.map(|oi| &card.options[oi]);
+        MoveInfo {
+            old_price: old.map_or(0, |o| o.price),
+            new_price: new.map_or(0, |o| o.price),
+            old_si: old.map(|o| o.store_idx),
+            new_si: new.map(|o| o.store_idx),
+        }
+    }
+
+    #[test]
+    fn delta_pre_matches_reference() {
+        for strategy in [Strategy::Cheapest, Strategy::Simplest] {
+            let input = test_input();
+            let config = WizardConfig {
+                strategy,
+                tolerance: 1,
+            };
+            let choices = vec![Some(1), Some(0), None];
+            let scored = ScoredAssignment::new(Assignment { choices }, &input, &config);
+
+            let mut store_shipping = vec![0u64; input.store_names.len()];
+            for (si, &count) in scored.store_card_counts.iter().enumerate() {
+                if count > 0 {
+                    store_shipping[si] =
+                        input.shipping_cost(si, scored.store_totals[si] as u64, count);
+                }
+            }
+            let pre = DeltaPrecompute {
+                base_excess: scored.num_skipped.saturating_sub(config.tolerance),
+                base_store_penalty: if matches!(strategy, Strategy::Cheapest) {
+                    (scored.num_stores.saturating_sub(1)) as i64 * STORE_PENALTY as i64
+                } else {
+                    0
+                },
+                store_shipping,
+            };
+
+            for (ci, card) in input.cards.iter().enumerate() {
+                let old_oi = scored.choices[ci];
+                let hoist = scored.move1_hoist(ci, &input, &config, &pre);
+                for new_oi_raw in 0..=card.options.len() {
+                    let new_oi = if new_oi_raw < card.options.len() {
+                        Some(new_oi_raw)
+                    } else {
+                        None
+                    };
+                    if old_oi == new_oi {
+                        continue;
+                    }
+                    let info = move_info(card, old_oi, new_oi);
+                    let reference = scored.delta_from_info(&info, &input, &config);
+                    let fast = scored.delta_from_info_pre(&info, &input, &config, &pre);
+                    assert_eq!(
+                        reference, fast,
+                        "{strategy:?} ci={ci} old={old_oi:?} new={new_oi:?}"
+                    );
+
+                    if let Some(oi) = new_oi {
+                        let opt = &card.options[oi];
+                        let move1 = scored.move1_delta(
+                            &hoist,
+                            opt.store_idx,
+                            opt.price,
+                            &input,
+                            &config,
+                            &pre,
+                        );
+                        assert_eq!(
+                            fast, move1,
+                            "move1 {strategy:?} ci={ci} old={old_oi:?} new={new_oi:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swap_and_merge_scores_match_apply() {
+        for strategy in [Strategy::Cheapest, Strategy::Simplest] {
+            let input = test_input();
+            let config = WizardConfig {
+                strategy,
+                tolerance: 1,
+            };
+            // c0 -> store1, c1 -> store0, c2 skipped.  Two used stores to swap/merge.
+            let choices = vec![Some(1), Some(0), None];
+            let scored = ScoredAssignment::new(Assignment { choices }, &input, &config);
+
+            let mut store_shipping = vec![0u64; input.store_names.len()];
+            for (si, &count) in scored.store_card_counts.iter().enumerate() {
+                if count > 0 {
+                    store_shipping[si] =
+                        input.shipping_cost(si, scored.store_totals[si] as u64, count);
+                }
+            }
+            let pre = DeltaPrecompute {
+                base_excess: scored.num_skipped.saturating_sub(config.tolerance),
+                base_store_penalty: if matches!(strategy, Strategy::Cheapest) {
+                    (scored.num_stores.saturating_sub(1)) as i64 * STORE_PENALTY as i64
+                } else {
+                    0
+                },
+                store_shipping,
+            };
+
+            // Swap c0 (store1) <-> c1 (store0).
+            {
+                let ci = 0;
+                let ci_new_oi = 0; // c0 -> store0
+                let cj = 1;
+                let cj_new_oi = 1; // c1 -> store1
+                let analytic = scored.score.wrapping_add_signed(
+                    scored.swap_delta(ci, ci_new_oi, cj, cj_new_oi, &input, &pre),
+                );
+                let mut nb = scored.clone();
+                nb.apply_single_move(ci, Some(ci_new_oi), &input, &config);
+                nb.apply_single_move(cj, Some(cj_new_oi), &input, &config);
+                assert_eq!(nb.score, analytic, "swap {strategy:?}");
+            }
+
+            // Merge store0 (holds c1) into store1.
+            {
+                let from_si = 0;
+                let to_si = 1;
+                let moves = vec![(1usize, 1usize)]; // c1 -> store1 cheapest
+                let analytic = scored.merge_score(from_si, to_si, &moves, &input, &config, &pre);
+                let mut nb = scored.clone();
+                for &(ci, oi) in &moves {
+                    nb.apply_single_move(ci, Some(oi), &input, &config);
+                }
+                assert_eq!(nb.score, analytic, "merge {strategy:?}");
+            }
+        }
     }
 }
