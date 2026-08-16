@@ -19,6 +19,9 @@ pub struct StoreStatus {
     pub store: String,
     pub status: String,
     pub cards_found: usize,
+    /// Number of cards this store failed to fetch (errored or skipped due to
+    /// a block). Distinct from "no results", which still counts as fetched.
+    pub cards_failed: usize,
 }
 
 // ── Request types ────────────────────────────────────────────────────────────
@@ -649,6 +652,7 @@ async fn start_fetch(
                         store: name,
                         status: "pending".into(),
                         cards_found: 0,
+                        cards_failed: 0,
                     },
                 )
             })
@@ -1136,8 +1140,10 @@ fn run_search_parallel(
                 .expect("Failed to build per-store HTTP client");
 
             let mut store_cards_found: usize = 0;
+            let mut store_cards_failed: usize = 0;
 
             for card_name in cards.iter() {
+                let mut card_failed = false;
                 {
                     let mut cur = current.lock().unwrap();
                     cur.0 = store_name.clone();
@@ -1172,10 +1178,10 @@ fn run_search_parallel(
                                 if sub_results.is_empty() {
                                     let gave_up = key.starts_with("cardmarket")
                                         && stores::cardmarket::is_blocked();
-                                    if !gave_up {
-                                        if let Some(ref c) = cache {
-                                            let _ = c.store(card_name, key, None);
-                                        }
+                                    if gave_up {
+                                        card_failed = true;
+                                    } else if let Some(ref c) = cache {
+                                        let _ = c.store(card_name, key, None);
                                     }
                                 } else {
                                     if let Some(ref c) = cache {
@@ -1198,6 +1204,7 @@ fn run_search_parallel(
                                 }
                             }
                             Err(e) => {
+                                card_failed = true;
                                 if e.downcast_ref::<stores::cardmarket::RescuePending>()
                                     .is_some()
                                 {
@@ -1222,6 +1229,9 @@ fn run_search_parallel(
 
                 let found_this_card = results_for_card.len();
                 store_cards_found += found_this_card;
+                if card_failed {
+                    store_cards_failed += 1;
+                }
 
                 for result in results_for_card {
                     if tx.send(result).is_err() {
@@ -1238,6 +1248,7 @@ fn run_search_parallel(
                 if let Some(entry) = ss.get_mut(&store_name) {
                     entry.status = "done".into();
                     entry.cards_found = store_cards_found;
+                    entry.cards_failed = store_cards_failed;
                 }
             }
         });

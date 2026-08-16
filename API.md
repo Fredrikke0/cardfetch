@@ -262,11 +262,11 @@ frontend knows which progress fields to display.
   "combos_done": 0,
   "combos_total": 0,
   "store_statuses": [
-    { "store": "outland.no",       "status": "fetching", "cards_found": 3 },
-    { "store": "finn.no",          "status": "fetching", "cards_found": 1 },
-    { "store": "collectible.no",   "status": "pending",  "cards_found": 0 },
-    { "store": "adamstuenretro.no","status": "pending",  "cards_found": 0 },
-    { "store": "cardmarket.com",   "status": "pending",  "cards_found": 0 }
+    { "store": "outland.no",       "status": "fetching", "cards_found": 3,  "cards_failed": 0 },
+    { "store": "finn.no",          "status": "fetching", "cards_found": 1,  "cards_failed": 0 },
+    { "store": "collectible.no",   "status": "pending",  "cards_found": 0,  "cards_failed": 0 },
+    { "store": "adamstuenretro.no","status": "pending",  "cards_found": 0,  "cards_failed": 0 },
+    { "store": "cardmarket.com",   "status": "pending",  "cards_found": 0,  "cards_failed": 0 }
   ]
 }
 ```
@@ -339,7 +339,7 @@ frontend can display a good solution without waiting for the exhaustive pass.
 | `partial_result` | wizard | Heuristic result, available early while exhaustive runs in background |
 | `result` | both | Final result object (only when `"done"`) — matches the `/fetch` or `/wizard` response format |
 | `error` | both | Error message (only when `"failed"`) |
-| `store_statuses` | fetch | Per-store progress breakdown. Status: `"pending"` → `"fetching"` → `"done"`. `cards_found` is total listing count for that store so far. Present on every fetch-job poll. |
+| `store_statuses` | fetch | Per-store progress breakdown. Status: `"pending"` → `"fetching"` → `"done"`. `cards_found` is total listing count for that store so far; `cards_failed` is the number of cards that could not be fetched (errored or skipped due to a block) — distinct from a clean empty result. Present on every fetch-job poll. |
 
 **Done response (fetch):**
 ```json
@@ -355,8 +355,8 @@ frontend can display a good solution without waiting for the exhaustive pass.
   "combos_done": 0,
   "combos_total": 0,
   "store_statuses": [
-    { "store": "outland.no",       "status": "done", "cards_found": 145 },
-    { "store": "cardmarket.com",   "status": "done", "cards_found": 82  }
+    { "store": "outland.no",       "status": "done", "cards_found": 145, "cards_failed": 0  },
+    { "store": "cardmarket.com",   "status": "done", "cards_found": 82,  "cards_failed": 2  }
   ],
   "result": {
     "r": {
