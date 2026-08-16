@@ -662,15 +662,32 @@ fn parse_card_page(card_name: &str, html: &str) -> anyhow::Result<Vec<SellerEntr
 
     let heading_sel =
         scraper::Selector::parse("h1").map_err(|e| anyhow::anyhow!("CSS 'h1': {}", e))?;
-    if let Some(heading) = document.select(&heading_sel).next() {
-        let heading_text = heading.text().collect::<String>().trim().to_string();
-        if !heading_text.is_empty() && !title_contains(card_name, &heading_text) {
-            anyhow::bail!(
-                "h1 mismatch: got '{}', expected '{}'",
-                heading_text,
-                card_name
-            );
+
+    let heading_text = match document.select(&heading_sel).next() {
+        Some(heading) => heading.text().collect::<String>().trim().to_string(),
+        None => {
+            // A genuine CardMarket card page always carries the card name in
+            // an <h1>. If it's absent and we also found no sellers, we almost
+            // certainly landed on a Cloudflare/error page rather than a real
+            // "no results" page, so bail instead of letting this empty result
+            // be negative-cached.
+            if entries.is_empty() {
+                anyhow::bail!("no <h1> found — page does not look like a CardMarket card page");
+            }
+            String::new()
         }
+    };
+
+    if !heading_text.is_empty() && !title_contains(card_name, &heading_text) {
+        anyhow::bail!(
+            "h1 mismatch: got '{}', expected '{}'",
+            heading_text,
+            card_name
+        );
+    }
+
+    if entries.is_empty() && heading_text.is_empty() {
+        anyhow::bail!("empty <h1> — page does not look like a CardMarket card page");
     }
 
     Ok(entries)
