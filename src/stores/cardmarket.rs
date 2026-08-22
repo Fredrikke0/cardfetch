@@ -52,6 +52,13 @@ fn record_cloudflare_block() {
     BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Reset the Cloudflare block counter so the next fetch batch gets a fresh
+/// chance instead of remaining permanently blocked.  Called at the end of each
+/// batch from `CardMarket::teardown`.
+fn reset_block_count() {
+    BLOCK_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// Check if an error is a Cloudflare challenge block.
 fn is_cloudflare_error(err: &anyhow::Error) -> bool {
     err.chain()
@@ -437,6 +444,7 @@ impl Store for CardMarket {
         let mut guard = self.session.lock().unwrap();
         *guard = None;
         self.card_cache.lock().unwrap().clear();
+        reset_block_count();
     }
 }
 
